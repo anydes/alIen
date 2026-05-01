@@ -1,206 +1,229 @@
+-- Wait for the game to be fully loaded before doing anything
+if not game:IsLoaded() then
+	game.Loaded:Wait()
+end
+
 local Players = game:GetService("Players")
+local CoreGui = game:GetService("CoreGui")
+local TextChatService = game:GetService("TextChatService")
+
 local localPlayer = Players.LocalPlayer
+
+local stripOtherPlayers = true
 
 local nameMap = {}
 local idMap = {}
 local usedNames = {}
-local watchedObjects = {}
+local watchedObjects = setmetatable({}, {__mode = "k"})
+local watchedRoots = setmetatable({}, {__mode = "k"})
 
-local function randomPradaName()
-    local suffixes = {
-        "Prada", "Prada1", "Prada2", "Prada3", "Prada4", "Prada5",
-        "PradaX", "PradaZ", "PradaA", "PradaB", "PradaC", "PradaD",
-        "PradaE", "PradaF", "PradaG", "PradaH"
-    }
-    for _, name in ipairs(suffixes) do
-        if not usedNames[name] then
-            usedNames[name] = true
-            return name
-        end
-    end
-    return "Prada" .. math.random(100, 999)
+local textClasses = {
+	TextLabel = true,
+	TextButton = true,
+	TextBox = true
+}
+
+local suffixes = {
+	"1234", "12341", "12342", "12343", "12344", "12345",
+	"1234X", "1234Z", "1234A", "1234B", "1234C", "1234D",
+	"1234E", "1234F", "1234G", "1234H"
+}
+
+local function random1234Name()
+	for _, name in ipairs(suffixes) do
+		if not usedNames[name] then
+			usedNames[name] = true
+			return name
+		end
+	end
+
+	local name
+	repeat
+		name = "1234" .. math.random(100, 999)
+	until not usedNames[name]
+
+	usedNames[name] = true
+	return name
 end
 
 local function randomFakeId()
-    return tostring(math.random(1000000, 9999999))
+	return tostring(math.random(1000000, 9999999))
+end
+
+local function addName(realName, fakeName)
+	if realName and realName ~= "" and not nameMap[realName] then
+		nameMap[realName] = fakeName or random1234Name()
+	end
 end
 
 local function buildMapsForPlayer(player)
-    if not nameMap[player.Name] then
-        nameMap[player.Name] = randomPradaName()
-    end
-    if player.DisplayName ~= player.Name and not nameMap[player.DisplayName] then
-        nameMap[player.DisplayName] = randomPradaName()
-    end
-    local uid = tostring(player.UserId)
-    if not idMap[uid] then
-        idMap[uid] = randomFakeId()
-    end
-end
+	if player == localPlayer then
+		addName(player.Name, "1234")
+		usedNames["1234"] = true
+	else
+		addName(player.Name)
+	end
 
--- Explicitly map local player first before anything else
-local function buildLocalPlayerMap()
-    -- Name
-    if not nameMap[localPlayer.Name] then
-        nameMap[localPlayer.Name] = "Prada"
-        usedNames["Prada"] = true
-    end
-    -- Display name
-    if localPlayer.DisplayName ~= localPlayer.Name then
-        if not nameMap[localPlayer.DisplayName] then
-            nameMap[localPlayer.DisplayName] = randomPradaName()
-        end
-    end
-    -- User ID
-    local uid = tostring(localPlayer.UserId)
-    if not idMap[uid] then
-        idMap[uid] = randomFakeId()
-    end
-end
+	if player.DisplayName ~= player.Name then
+		addName(player.DisplayName)
+	end
 
-local function buildAllMaps()
-    buildLocalPlayerMap()
-    for _, player in ipairs(Players:GetPlayers()) do
-        buildMapsForPlayer(player)
-    end
+	local uid = tostring(player.UserId)
+	if not idMap[uid] then
+		idMap[uid] = randomFakeId()
+	end
 end
 
 local function replaceAll(text)
-    if typeof(text) ~= "string" or text == "" then return text end
+	if typeof(text) ~= "string" or text == "" then
+		return text
+	end
 
-    for realName, fakeName in pairs(nameMap) do
-        local escaped = realName:gsub("([^%w])", "%%%1")
-        text = text:gsub(escaped, fakeName)
-    end
+	local newText = text
 
-    for realId, fakeId in pairs(idMap) do
-        text = text:gsub(realId, fakeId)
-    end
+	for realName, fakeName in pairs(nameMap) do
+		newText = newText:gsub(realName:gsub("([^%w])", "%%%1"), fakeName)
+	end
 
-    return text
+	for realId, fakeId in pairs(idMap) do
+		newText = newText:gsub(realId, fakeId)
+	end
+
+	return newText
 end
 
-local function processObject(obj)
-    pcall(function()
-        if obj:IsA("TextLabel") or obj:IsA("TextButton") or obj:IsA("TextBox") then
-            -- Always re-process even if watched, in case map grew
-            local replaced = replaceAll(obj.Text)
-            if replaced ~= obj.Text then
-                obj.Text = replaced
-            end
+local function processTextObject(obj)
+	if watchedObjects[obj] then
+		return
+	end
 
-            if not watchedObjects[obj] then
-                watchedObjects[obj] = true
-                obj:GetPropertyChangedSignal("Text"):Connect(function()
-                    local newText = replaceAll(obj.Text)
-                    if newText ~= obj.Text then
-                        obj.Text = newText
-                    end
-                end)
-            end
-        end
-    end)
+	if not textClasses[obj.ClassName] then
+		return
+	end
+
+	watchedObjects[obj] = true
+
+	local busy = false
+
+	local function update()
+		if busy then return end
+		busy = true
+
+		local oldText = obj.Text
+		local newText = replaceAll(oldText)
+
+		if newText ~= oldText then
+			obj.Text = newText
+		end
+
+		busy = false
+	end
+
+	update()
+
+	obj:GetPropertyChangedSignal("Text"):Connect(update)
 end
 
--- GetDescendants on absolutely everything
 local function scanRoot(root)
-    if not root then return end
-    pcall(function()
-        -- Process root itself
-        processObject(root)
+	if not root or watchedRoots[root] then
+		return
+	end
 
-        -- GetDescendants covers every single child, grandchild, etc.
-        for _, obj in ipairs(root:GetDescendants()) do
-            processObject(obj)
-        end
+	watchedRoots[root] = true
 
-        -- Watch for anything added in future
-        root.DescendantAdded:Connect(function(obj)
-            task.wait()
-            buildAllMaps() -- ensure maps are fresh
-            processObject(obj)
-        end)
-    end)
+	for _, obj in ipairs(root:GetDescendants()) do
+		processTextObject(obj)
+	end
+
+	root.DescendantAdded:Connect(function(obj)
+		task.defer(function()
+			processTextObject(obj)
+		end)
+	end)
 end
 
-local function scanEverything()
-    -- Entire DataModel top-level catch-all
-    pcall(scanRoot, game)
+local function stripCharacter(char)
+	if not char then return end
+	
+	local function checkAndRemove(obj)
+		if obj:IsA("Shirt") or obj:IsA("Pants") or obj:IsA("Accessory") or obj:IsA("ShirtGraphic") or obj:IsA("CharacterMesh") then
+			task.defer(function()
+				pcall(function() obj:Destroy() end)
+			end)
+		end
+	end
 
-    -- Every service explicitly with GetDescendants
-    local services = {
-        "CoreGui", "Workspace", "ReplicatedStorage", "ReplicatedFirst",
-        "Lighting", "StarterGui", "StarterPack", "StarterPlayer",
-        "Teams", "TextChatService", "SoundService", "Chat",
-        "LocalizationService", "Players"
-    }
-    for _, serviceName in ipairs(services) do
-        pcall(function()
-            scanRoot(game:GetService(serviceName))
-        end)
-    end
-
-    -- PlayerGui and Backpack explicitly
-    pcall(function() scanRoot(localPlayer:WaitForChild("PlayerGui", 5)) end)
-    pcall(function() scanRoot(localPlayer:WaitForChild("PlayerBackpack", 5)) end)
-
-    -- Every player's character
-    for _, player in ipairs(Players:GetPlayers()) do
-        pcall(function()
-            if player.Character then
-                scanRoot(player.Character)
-            end
-            player.CharacterAdded:Connect(function(char)
-                task.wait(0.5)
-                scanRoot(char)
-            end)
-        end)
-    end
+	for _, obj in ipairs(char:GetDescendants()) do
+		checkAndRemove(obj)
+	end
+	
+	char.DescendantAdded:Connect(checkAndRemove)
+	
+	local function updateColor()
+		local bodyColors = char:FindFirstChildOfClass("BodyColors")
+		if bodyColors then
+			bodyColors.HeadColor = BrickColor.new("Medium stone grey")
+			bodyColors.LeftArmColor = BrickColor.new("Medium stone grey")
+			bodyColors.RightArmColor = BrickColor.new("Medium stone grey")
+			bodyColors.LeftLegColor = BrickColor.new("Medium stone grey")
+			bodyColors.RightLegColor = BrickColor.new("Medium stone grey")
+			bodyColors.TorsoColor = BrickColor.new("Medium stone grey")
+		else
+			for _, part in ipairs(char:GetChildren()) do
+				if part:IsA("BasePart") then
+					part.BrickColor = BrickColor.new("Medium stone grey")
+				end
+			end
+		end
+	end
+	
+	updateColor()
+	
+	char.ChildAdded:Connect(function(obj)
+		if obj:IsA("BodyColors") then
+			updateColor()
+		elseif obj:IsA("BasePart") then
+			obj.BrickColor = BrickColor.new("Medium stone grey")
+		end
+	end)
 end
 
--- Rescan all already-found objects with latest maps
-local function rescanAllWatched()
-    for obj in pairs(watchedObjects) do
-        pcall(function()
-            if obj and obj.Parent then
-                local newText = replaceAll(obj.Text)
-                if newText ~= obj.Text then
-                    obj.Text = newText
-                end
-            else
-                watchedObjects[obj] = nil
-            end
-        end)
-    end
+local function scanPlayer(player)
+	buildMapsForPlayer(player)
+
+	if player.Character then
+		scanRoot(player.Character)
+		if stripOtherPlayers and player ~= localPlayer then
+			stripCharacter(player.Character)
+		end
+	end
+
+	player.CharacterAdded:Connect(function(char)
+		task.wait(0.25)
+		scanRoot(char)
+		if stripOtherPlayers and player ~= localPlayer then
+			stripCharacter(char)
+		end
+	end)
 end
 
--- Continuous loop every 1 second
-task.spawn(function()
-    while true do
-        task.wait(1)
-        buildAllMaps()
-        scanEverything()
-        rescanAllWatched()
-    end
+for _, player in ipairs(Players:GetPlayers()) do
+	scanPlayer(player)
+end
+
+Players.PlayerAdded:Connect(scanPlayer)
+
+local playerGui = localPlayer:WaitForChild("PlayerGui", 10)
+if playerGui then
+	scanRoot(playerGui)
+end
+
+pcall(function()
+	scanRoot(CoreGui)
 end)
 
-Players.PlayerAdded:Connect(function(player)
-    task.wait(0.5)
-    buildMapsForPlayer(player)
-    scanEverything()
-    player.CharacterAdded:Connect(function(char)
-        task.wait(0.5)
-        scanRoot(char)
-    end)
+pcall(function()
+	scanRoot(TextChatService)
 end)
 
-Players.PlayerRemoving:Connect(function()
-    watchedObjects = {}
-end)
-
--- Init: build local player map FIRST before anything is scanned
-buildLocalPlayerMap()
-buildAllMaps()
-scanEverything()
-
-print("Stream privacy active — local player: " .. localPlayer.Name .. " -> " .. nameMap[localPlayer.Name])
+print("Stream privacy active:", localPlayer.Name, "->", nameMap[localPlayer.Name])
