@@ -10,7 +10,7 @@ _G.__AUTOFARM_PB_LOADED__ = true
 local AUTOFARM_PLACE_ID = 18517963950
 local PLACE_ID_EXTRA_PLAYERS_CHECK = 18517967096
 
-local FARMER_NAME = "Z0eClaw44"
+local FARMER_NAME = "XxPaisl3yH3r0xX45"
 local SACRIFICE_NAME = "OwenQueenHawk"
 
 -- ═══════════════════════════════════════════════════════════════════
@@ -216,19 +216,19 @@ local spotQueueActive = false
 local config = {
     sacrifice = SACRIFICE_NAME,
     farmer = FARMER_NAME,
-    scoreMethod = "dunk", -- "shoot" or "dunk"
+    scoreMethod = "shoot", -- "shoot" or "dunk"
     endMethod = "score", -- "score" = 21-0/22-0 trigger, "shots" = old shotsToTake trigger
     defesnebadges = false, -- if true: override ankle/shoot/dunk logic with defense-badge behavior
     blocksToGet = 15, -- used only when defesnebadges=true (SACRIFICE teleports after this many blocks)
     tweenSpeed = 1.5, -- default tween time for general movement tweens
     movementCheck = 0.05,
     regroupDist = 4.5,
-    shootDist = 12,
+    shootDist = 37,
     shootDistTolerance = 1, -- allowed +/- studs from shootDist before retrying
     followDist = 4.5,
-    anklesToShoot = 1,
+    anklesToShoot = 13,
     shotsToTake = 11,
-    shootTweenTime = 0.5,
+    shootTweenTime = 0.7,
     spotCoords = Vector3.new(486, 85, 111),
 
     -- Stability controls: keep these true/false instead of adding error-code recovery loops.
