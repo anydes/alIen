@@ -10,7 +10,7 @@ _G.__AUTOFARM_PB_LOADED__ = true
 local AUTOFARM_PLACE_ID = 18517963950
 local PLACE_ID_EXTRA_PLAYERS_CHECK = 18517967096
 
-local FARMER_NAME = "XxPaisl3yH3r0xX45"
+local FARMER_NAME = "o9pps"
 local SACRIFICE_NAME = "OwenQueenHawk"
 
 -- ═══════════════════════════════════════════════════════════════════
