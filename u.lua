@@ -218,7 +218,7 @@ local config = {
     farmer = FARMER_NAME,
     scoreMethod = "shoot", -- "shoot" or "dunk"
     endMethod = "score", -- "score" = 21-0/22-0 trigger, "shots" = old shotsToTake trigger
-    defesnebadges = false, -- if true: override ankle/shoot/dunk logic with defense-badge behavior
+    defesnebadges = true, -- if true: override ankle/shoot/dunk logic with defense-badge behavior
     blocksToGet = 15, -- used only when defesnebadges=true (SACRIFICE teleports after this many blocks)
     tweenSpeed = 1.5, -- default tween time for general movement tweens
     movementCheck = 0.05,
@@ -226,7 +226,7 @@ local config = {
     shootDist = 37,
     shootDistTolerance = 1, -- allowed +/- studs from shootDist before retrying
     followDist = 4.5,
-    anklesToShoot = 13,
+    anklesToShoot = 1,
     shotsToTake = 11,
     shootTweenTime = 0.7,
     spotCoords = Vector3.new(486, 85, 111),
