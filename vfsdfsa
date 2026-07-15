@@ -3,7 +3,7 @@ local SaveManager = loadstring(game:HttpGetAsync("https://raw.githubusercontent.
 local InterfaceManager = loadstring(game:HttpGetAsync("https://raw.githubusercontent.com/ActualMasterOogway/Fluent-Renewed/master/Addons/InterfaceManager.luau"))()
 
 local Window = Library:CreateWindow{
-    Title = "Hoop Nation",
+    Title = "above the rim",
     SubTitle = "    Vanta | Beta 1.0",
     TabWidth = 160,
     Size = UDim2.fromOffset(580, 460),
@@ -34,29 +34,54 @@ local function opt(name, fallback)
     return Options[name] and Options[name].Value or fallback
 end
 
+local function cameraXZ()
+    local cam = workspace.CurrentCamera
+    if not cam then return nil, nil end
+    local look = Vector3.new(cam.CFrame.LookVector.X, 0, cam.CFrame.LookVector.Z)
+    local right = Vector3.new(cam.CFrame.RightVector.X, 0, cam.CFrame.RightVector.Z)
+    if look.Magnitude < 1e-4 or right.Magnitude < 1e-4 then return nil, nil end
+    return look.Unit, right.Unit
+end
+
 local function getMoveDirection()
-    local hum = client.Character and client.Character:FindFirstChildWhichIsA("Humanoid")
-    if hum and hum.MoveDirection.Magnitude > 0.01 then
-        return hum.MoveDirection, hum.WalkSpeed
+    local walkSpeed = 16
+
+    -- Prefer real MoveDirection (works for keyboard, mouse, controller)
+    for _, parent in {client.Character, workspace.Proxy, characters:FindFirstChild(client.Name)} do
+        if not parent then continue end
+        local hum = parent:FindFirstChildWhichIsA("Humanoid")
+        if not hum then continue end
+        walkSpeed = hum.WalkSpeed
+        if hum.MoveDirection.Magnitude > 0.01 then
+            return hum.MoveDirection, walkSpeed
+        end
     end
 
-    hum = workspace.Proxy:FindFirstChildWhichIsA("Humanoid")
-    if hum and hum.MoveDirection.Magnitude > 0.01 then
-        return hum.MoveDirection, hum.WalkSpeed
-    end
+    local look, right = cameraXZ()
+    if not look then return Vector3.zero, walkSpeed end
 
+    -- Keyboard / arrow keys
     local x, z = 0, 0
     if userInputService:IsKeyDown(Enum.KeyCode.W) or userInputService:IsKeyDown(Enum.KeyCode.Up) then z -= 1 end
     if userInputService:IsKeyDown(Enum.KeyCode.S) or userInputService:IsKeyDown(Enum.KeyCode.Down) then z += 1 end
     if userInputService:IsKeyDown(Enum.KeyCode.A) or userInputService:IsKeyDown(Enum.KeyCode.Left) then x -= 1 end
     if userInputService:IsKeyDown(Enum.KeyCode.D) or userInputService:IsKeyDown(Enum.KeyCode.Right) then x += 1 end
-    if x == 0 and z == 0 then return Vector3.zero, 16 end
+    if x ~= 0 or z ~= 0 then
+        return (look * -z + right * x).Unit, walkSpeed
+    end
 
-    local cam = workspace.CurrentCamera
-    if not cam then return Vector3.zero, 16 end
-    local look = Vector3.new(cam.CFrame.LookVector.X, 0, cam.CFrame.LookVector.Z).Unit
-    local right = Vector3.new(cam.CFrame.RightVector.X, 0, cam.CFrame.RightVector.Z).Unit
-    return (look * -z + right * x).Unit, 16
+    -- Controller stick (no invert)
+    for _, input in userInputService:GetGamepadState(Enum.UserInputType.Gamepad1) do
+        if input.KeyCode ~= Enum.KeyCode.Thumbstick1 then continue end
+        local sx, sy = input.Position.X, input.Position.Y
+        if math.abs(sx) < 0.15 and math.abs(sy) < 0.15 then continue end
+        local dir = right * sx + look * sy
+        if dir.Magnitude > 0.01 then
+            return dir.Unit, walkSpeed
+        end
+    end
+
+    return Vector3.zero, walkSpeed
 end
 
 local function disconnect(list)
@@ -225,7 +250,7 @@ Options.AutoRunUp:OnChanged(function(v) if v then startAutoRunUp() else stopAuto
 
 -- Player
 Tabs.Player:CreateToggle("SpeedEnabled", {Title = "Speed", Default = false})
-Tabs.Player:CreateSlider("SpeedValue", {Title = "Amount", Default = 50, Min = 20, Max = 100, Rounding = 0})
+Tabs.Player:CreateSlider("SpeedValue", {Title = "Amount", Default = 20, Min = 16, Max = 30, Rounding = 0})
 
 runService:BindToRenderStep("VantaSpeed", Enum.RenderPriority.Last.Value, function(dt)
     if not opt("SpeedEnabled", false) then return end
@@ -246,7 +271,7 @@ InterfaceManager:SetLibrary(Library)
 SaveManager:IgnoreThemeSettings()
 SaveManager:SetIgnoreIndexes{}
 InterfaceManager:SetFolder("vanta")
-SaveManager:SetFolder("vanta/hoopnation")
+SaveManager:SetFolder("vanta/abovetherim")
 InterfaceManager:BuildInterfaceSection(Tabs.Settings)
 SaveManager:BuildConfigSection(Tabs.Settings)
 
