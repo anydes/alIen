@@ -3,7 +3,7 @@ local SaveManager = loadstring(game:HttpGetAsync("https://raw.githubusercontent.
 local InterfaceManager = loadstring(game:HttpGetAsync("https://raw.githubusercontent.com/ActualMasterOogway/Fluent-Renewed/master/Addons/InterfaceManager.luau"))()
 
 local Window = Library:CreateWindow{
-    Title = "above the rim",
+    Title = "Hoop Nation",
     SubTitle = "    Vanta | Beta 1.0",
     TabWidth = 160,
     Size = UDim2.fromOffset(580, 460),
