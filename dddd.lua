@@ -649,7 +649,7 @@ SaveManager:SetFolder("pbvanta/config")
     local RunService = game:GetService("RunService")
 
     local RECOIL_MODE        = "Tween"
-    local RECOIL_DISTANCE    = 2
+    local RECOIL_DISTANCE    = 3
     local TWEEN_TIME         = 0.2
     local GUARDER_CHECK_RATE = 10
 
@@ -1110,6 +1110,13 @@ Tabs.Player:CreateToggle("Player_Movement_AntiStun", {
     end
 })
 
+local function cframeSpeedMethod(moveVector, deltaTime)
+    if not (humanoidRootPart and humanoidRootPart.Parent and humanoid and humanoid.Parent) then return end
+    if moveVector.Magnitude > 0 then
+        humanoidRootPart.CFrame = humanoidRootPart.CFrame + (moveVector * MOVE_SPEED * deltaTime)
+    end
+end
+
 Tabs.Player:CreateToggle("Player_Movement_Walkspeed", {
     Title = "Speedhacks",
     Default = false,
@@ -1124,34 +1131,40 @@ Tabs.Player:CreateToggle("Player_Movement_Walkspeed", {
                 humanoidRootPart = character:WaitForChild("HumanoidRootPart")
                 bindSpeedBallListeners(character)
             end)
-            -- Apply CFrame movement when speed boost is active (Heartbeat avoids stacking on render step)
+
+            -- Apply CFrame movement each Heartbeat, sourced from the humanoid's MoveDirection
+            if speedConnection then speedConnection:Disconnect() end
             speedConnection = RunService.Heartbeat:Connect(function(deltaTime)
                 if not speedActive then return end
                 if characterHasBall then return end
                 if not (humanoidRootPart and humanoidRootPart.Parent and humanoid and humanoid.Parent) then return end
-                local moveDirection = humanoid.MoveDirection
-                if moveDirection.Magnitude > 0 then
-                    moveDirection = moveDirection.Unit
-                    humanoidRootPart.CFrame = humanoidRootPart.CFrame + 
-                        (moveDirection * MOVE_SPEED * deltaTime)
+
+                local moveVector = humanoid.MoveDirection
+                if moveVector.Magnitude > 0 then
+                    moveVector = moveVector.Unit
                 end
+
+                cframeSpeedMethod(moveVector, deltaTime)
             end)
         else
+            speedActive = false
+            if speedConnection then speedConnection:Disconnect() speedConnection = nil end
+            if speedCharConn then speedCharConn:Disconnect() speedCharConn = nil end
             disableNormalWalkspeed()
         end
     end
 })
-    
-    Tabs.Player:CreateSlider("Player_Movement_WalkspeedAmount", {
-        Title = "Speed amount",
-        Default = 2,
-        Max = 10,
-        Min = 1,
-        Rounding = 1,
-        Callback = function(Value)
-            MOVE_SPEED = Value
-        end
-    })
+
+Tabs.Player:CreateSlider("Player_Movement_WalkspeedAmount", {
+    Title = "Speed amount",
+    Default = 2,
+    Max = 10,
+    Min = 1,
+    Rounding = 0,
+    Callback = function(Value)
+        MOVE_SPEED = Value
+    end
+})
 
 if type(getgc) == "function" then
     local function getGcRoots()
