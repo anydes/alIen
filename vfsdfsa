@@ -225,7 +225,7 @@ Options.AutoRunUp:OnChanged(function(v) if v then startAutoRunUp() else stopAuto
 
 -- Player
 Tabs.Player:CreateToggle("SpeedEnabled", {Title = "Speed", Default = false})
-Tabs.Player:CreateSlider("SpeedValue", {Title = "Amount", Default = 20, Min = 16, Max = 30, Rounding = 0})
+Tabs.Player:CreateSlider("SpeedValue", {Title = "Amount", Default = 50, Min = 20, Max = 100, Rounding = 0})
 
 runService:BindToRenderStep("VantaSpeed", Enum.RenderPriority.Last.Value, function(dt)
     if not opt("SpeedEnabled", false) then return end
