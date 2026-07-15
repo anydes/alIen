@@ -1,0 +1,258 @@
+local Library = loadstring(game:HttpGetAsync("https://github.com/ActualMasterOogway/Fluent-Renewed/releases/latest/download/Fluent.luau"))()
+local SaveManager = loadstring(game:HttpGetAsync("https://raw.githubusercontent.com/ActualMasterOogway/Fluent-Renewed/master/Addons/SaveManager.luau"))()
+local InterfaceManager = loadstring(game:HttpGetAsync("https://raw.githubusercontent.com/ActualMasterOogway/Fluent-Renewed/master/Addons/InterfaceManager.luau"))()
+
+local Window = Library:CreateWindow{
+    Title = "above the rim",
+    SubTitle = "    Vanta | Beta 1.0",
+    TabWidth = 160,
+    Size = UDim2.fromOffset(580, 460),
+    Resize = true,
+    MinSize = Vector2.new(470, 380),
+    Acrylic = true,
+    Theme = "Dark",
+    MinimizeKey = Enum.KeyCode.RightControl
+}
+
+local Tabs = {
+    Shooting = Window:CreateTab{Title = "Shooting", Icon = "phosphor-target-bold"},
+    Defense = Window:CreateTab{Title = "Defense", Icon = "phosphor-shield-bold"},
+    Player = Window:CreateTab{Title = "Player", Icon = "phosphor-person-bold"},
+    Settings = Window:CreateTab{Title = "Settings", Icon = "settings"}
+}
+
+local Options = Library.Options
+local players = game:GetService("Players")
+local runService = game:GetService("RunService")
+local userInputService = game:GetService("UserInputService")
+local client = players.LocalPlayer
+
+local characters = workspace:WaitForChild("Characters")
+local proxyHrp = workspace:WaitForChild("Proxy"):WaitForChild("HumanoidRootPart")
+
+local function opt(name, fallback)
+    return Options[name] and Options[name].Value or fallback
+end
+
+local function getMoveDirection()
+    local hum = client.Character and client.Character:FindFirstChildWhichIsA("Humanoid")
+    if hum and hum.MoveDirection.Magnitude > 0.01 then
+        return hum.MoveDirection, hum.WalkSpeed
+    end
+
+    hum = workspace.Proxy:FindFirstChildWhichIsA("Humanoid")
+    if hum and hum.MoveDirection.Magnitude > 0.01 then
+        return hum.MoveDirection, hum.WalkSpeed
+    end
+
+    local x, z = 0, 0
+    if userInputService:IsKeyDown(Enum.KeyCode.W) or userInputService:IsKeyDown(Enum.KeyCode.Up) then z -= 1 end
+    if userInputService:IsKeyDown(Enum.KeyCode.S) or userInputService:IsKeyDown(Enum.KeyCode.Down) then z += 1 end
+    if userInputService:IsKeyDown(Enum.KeyCode.A) or userInputService:IsKeyDown(Enum.KeyCode.Left) then x -= 1 end
+    if userInputService:IsKeyDown(Enum.KeyCode.D) or userInputService:IsKeyDown(Enum.KeyCode.Right) then x += 1 end
+    if x == 0 and z == 0 then return Vector3.zero, 16 end
+
+    local cam = workspace.CurrentCamera
+    if not cam then return Vector3.zero, 16 end
+    local look = Vector3.new(cam.CFrame.LookVector.X, 0, cam.CFrame.LookVector.Z).Unit
+    local right = Vector3.new(cam.CFrame.RightVector.X, 0, cam.CFrame.RightVector.Z).Unit
+    return (look * -z + right * x).Unit, 16
+end
+
+local function disconnect(list)
+    for i = 1, #list do
+        if list[i] then list[i]:Disconnect() end
+        list[i] = nil
+    end
+end
+
+-- Shooting
+local TestingSection = Tabs.Shooting:AddSection("(testing)")
+TestingSection:AddToggle("AntiContest", {Title = "Anti Contest", Default = false})
+TestingSection:AddSlider("AntiContestDistance", {Title = "Recoil Distance", Default = 3, Min = 1, Max = 5, Rounding = 1})
+TestingSection:AddSlider("AntiContestTweenTime", {Title = "Tween Time", Default = 0.12, Min = 0, Max = 0.2, Rounding = 2})
+
+local antiConns = {}
+local antiState = {shooting = false, wasShooting = false, active = false, elapsed = 0, startCF = nil, guarder = nil, frame = 0, cachedGuarder = nil}
+
+local function flatLook(cf)
+    local flat = Vector3.new(cf.LookVector.X, 0, cf.LookVector.Z)
+    if flat.Magnitude < 1e-4 then
+        flat = Vector3.new(cf.RightVector.X, 0, cf.RightVector.Z)
+    end
+    return flat.Magnitude > 1e-4 and flat.Unit or nil
+end
+
+local function goalCF(guarderCF, startCF, distance)
+    local dir = flatLook(guarderCF)
+    if not dir then return startCF end
+    local pos = startCF.Position + dir * distance
+    return CFrame.new(pos, pos + startCF.LookVector)
+end
+
+local function stopAntiContest()
+    disconnect(antiConns)
+    antiState.active = false
+    antiState.guarder = nil
+    antiState.cachedGuarder = nil
+    antiState.shooting = false
+    antiState.wasShooting = false
+end
+
+local function startAntiContest()
+    stopAntiContest()
+    local char = characters:WaitForChild(client.Name)
+
+    local function scanGuarder()
+        local closest, best = nil, math.huge
+        for _, p in players:GetPlayers() do
+            if p == client then continue end
+            local pChar = characters:FindFirstChild(p.Name)
+            local root = pChar and pChar:FindFirstChild("HumanoidRootPart")
+            if pChar and pChar:GetAttribute("Guard") == true and root then
+                local dist = (proxyHrp.Position - root.Position).Magnitude
+                if dist < best then best, closest = dist, root end
+            end
+        end
+        antiState.cachedGuarder = closest
+    end
+
+    antiConns[1] = char.AttributeChanged:Connect(function(attr)
+        if attr == "Action" then
+            antiState.shooting = char:GetAttribute("Action") == "Shooting"
+        end
+    end)
+
+    antiConns[2] = runService.Heartbeat:Connect(function(dt)
+        antiState.frame += 1
+        if antiState.frame % 10 == 0 then scanGuarder() end
+
+        if antiState.shooting and not antiState.wasShooting then
+            local guarder = antiState.cachedGuarder
+            if guarder and guarder.Parent then
+                antiState.startCF = proxyHrp.CFrame
+                antiState.guarder = guarder
+                antiState.elapsed = 0
+                antiState.active = true
+            end
+        end
+
+        if antiState.active then
+            local guarder = antiState.guarder
+            if not guarder or not guarder.Parent then
+                antiState.active = false
+            else
+                antiState.elapsed += dt
+                local t = math.min(antiState.elapsed / opt("AntiContestTweenTime", 0.12), 1)
+                if t >= 1 then antiState.active = false end
+                local eased = 1 - (1 - t) * (1 - t)
+                local target = goalCF(guarder.CFrame, antiState.startCF, opt("AntiContestDistance", 3))
+                proxyHrp.CFrame = antiState.startCF:Lerp(target, eased)
+            end
+        end
+
+        antiState.wasShooting = antiState.shooting
+    end)
+
+    antiConns[3] = char.AncestryChanged:Connect(function()
+        if not char:IsDescendantOf(game) and opt("AntiContest", false) then
+            stopAntiContest()
+            task.defer(startAntiContest)
+        end
+    end)
+end
+
+Options.AntiContest:OnChanged(function(v) if v then startAntiContest() else stopAntiContest() end end)
+
+-- Defense
+local ContestSection = Tabs.Defense:AddSection("contest")
+ContestSection:AddToggle("AutoRunUp", {Title = "Auto Run Up", Default = false})
+
+local LERP_SPEED = 0.02
+local FRONT_OFFSET = 0.1
+
+local runUpConns = {}
+local runUpY
+
+local function stopAutoRunUp()
+    disconnect(runUpConns)
+    runUpY = nil
+end
+
+local function startAutoRunUp()
+    stopAutoRunUp()
+    local char = characters:WaitForChild(client.Name)
+    runUpY = proxyHrp.Position.Y
+
+    runUpConns[1] = runService.Heartbeat:Connect(function()
+        if char:GetAttribute("Guard") ~= true then return end
+
+        local closest, dist = nil, math.huge
+        for _, p in players:GetPlayers() do
+            if p == client then continue end
+            local pChar = characters:FindFirstChild(p.Name)
+            local root = pChar and pChar:FindFirstChild("HumanoidRootPart")
+            if root then
+                local d = (proxyHrp.Position - root.Position).Magnitude
+                if d < dist then dist, closest = d, p end
+            end
+        end
+
+        if not closest or dist > 20 then return end
+
+        local targetChar = characters:FindFirstChild(closest.Name)
+        local action = targetChar and targetChar:GetAttribute("Action")
+        if action ~= "Shooting" and action ~= "Dunking" then return end
+
+        local targetRoot = targetChar:FindFirstChild("HumanoidRootPart")
+        if not targetRoot then return end
+
+        local face = targetRoot.Position + targetRoot.CFrame.LookVector * FRONT_OFFSET
+        face = Vector3.new(face.X, runUpY, face.Z)
+        local lookAt = Vector3.new(targetRoot.Position.X, runUpY, targetRoot.Position.Z)
+        proxyHrp.CFrame = proxyHrp.CFrame:Lerp(CFrame.new(face, lookAt), LERP_SPEED)
+    end)
+
+    runUpConns[2] = char.AncestryChanged:Connect(function()
+        if not char:IsDescendantOf(game) and opt("AutoRunUp", false) then
+            stopAutoRunUp()
+            task.defer(startAutoRunUp)
+        end
+    end)
+end
+
+Options.AutoRunUp:OnChanged(function(v) if v then startAutoRunUp() else stopAutoRunUp() end end)
+
+-- Player
+Tabs.Player:CreateToggle("SpeedEnabled", {Title = "Speed", Default = false})
+Tabs.Player:CreateSlider("SpeedValue", {Title = "Amount", Default = 20, Min = 16, Max = 30, Rounding = 0})
+
+runService:BindToRenderStep("VantaSpeed", Enum.RenderPriority.Last.Value, function(dt)
+    if not opt("SpeedEnabled", false) then return end
+
+    local moveDir, walkSpeed = getMoveDirection()
+    if moveDir.Magnitude < 0.01 then return end
+
+    local speed = opt("SpeedValue", 20)
+    local boost = math.max(speed - (walkSpeed or 16), 0)
+    if boost <= 0 then return end
+
+    proxyHrp.CFrame += moveDir * boost * dt
+end)
+
+-- Addons
+SaveManager:SetLibrary(Library)
+InterfaceManager:SetLibrary(Library)
+SaveManager:IgnoreThemeSettings()
+SaveManager:SetIgnoreIndexes{}
+InterfaceManager:SetFolder("vanta")
+SaveManager:SetFolder("vanta/hoopnation")
+InterfaceManager:BuildInterfaceSection(Tabs.Settings)
+SaveManager:BuildConfigSection(Tabs.Settings)
+
+Window:SelectTab(1)
+Library:Notify{Title = "Loaded", Content = "The script has been loaded.", Duration = 8}
+
+SaveManager:LoadAutoloadConfig()
+if opt("AntiContest", false) then startAntiContest() end
+if opt("AutoRunUp", false) then startAutoRunUp() end
