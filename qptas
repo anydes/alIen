@@ -1,0 +1,1741 @@
+do
+	local WindUI = loadstring(game:HttpGet("https://github.com/Footagesus/WindUI/releases/latest/download/main.lua"))();
+	local HttpService = game:GetService("HttpService")
+
+	-- Config Folder Settings - Easy to change
+	local CONFIG_FOLDER = "Practical Basketball/config"
+
+local Window = WindUI:CreateWindow({
+	Title = "Vanta | 1.0",
+	Icon = "infinity",
+	Author = "Practical Basketball",
+	Folder = CONFIG_FOLDER,
+	Size = UDim2.fromOffset(300, 270),
+	Transparent = true,
+	Theme = "Dark",
+	SideBarWidth = 200,
+	UserEnabled = true,
+	HasOutline = true,
+	
+	OpenButton = {
+		Title = "Open Vanta UI",
+		CornerRadius = UDim.new(1, 0),
+		StrokeThickness = 3,
+		Enabled = true,
+		Draggable = true,
+		OnlyMobile = true,
+		
+		Color = ColorSequence.new(
+			Color3.fromHex("#8B5CF6"),
+			Color3.fromHex("#3B82F6")
+		)
+	}
+});
+
+
+
+	local Tabs = {
+		Maintab = Window:Tab({
+			Title = "Shooting",
+			Icon = "target"
+		}),
+
+		Dribbletab = Window:Tab({
+			Title = "Dribbling",
+			Icon = "volleyball"
+		}),
+
+		PlayerTab = Window:Tab({
+			Title = "Player",
+			Icon = "user"
+		}), 
+
+		DefenseTab = Window:Tab({
+			Title = "Defense",
+			Icon = "shield"
+		}),            
+
+		MiscTab = Window:Tab({
+			Title = "Misc",
+			Icon = "corner-left-down"
+		}),   
+
+
+		b = Window:Divider(),
+		WindowTab = Window:Tab({
+			Title = "Settings",
+			Icon = "settings",
+			Desc = "Manage window settings and file configurations."
+		})
+	};
+
+    Tabs.Maintab:Select()
+
+	local Background = Window.UIElements.MainBar.Background
+	Background.ImageTransparency = 1
+
+-- Get the ReplicatedStorage service
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+
+
+
+	-- Theme
+	do
+		WindUI:AddTheme({
+			Name = "Vanta",
+			
+			Accent = Color3.fromHex("#6200ff"),
+			Dialog = Color3.fromHex("#0c4a6e"),
+			Outline = Color3.fromHex("#4c00a8"),
+			Text = Color3.fromHex("#f0f9ff"),
+			Placeholder = Color3.fromHex("#450099"),
+			Background = Color3.fromHex("#000000"),
+			Button = Color3.fromHex("#6200ff"),
+			Icon = Color3.fromHex("#883ffc"),
+			Hover = Color3.fromHex("#f0f9ff"),
+			Slider = Color3.fromHex("#6200ff"),
+			SliderThumb = Color3.fromHex("#792af7"), 
+			TabBackground = Color3.fromHex("#6200ff"),
+            ElementBackground = Color3.fromHex("#6200ff"),
+        })
+
+		WindUI:SetTheme("Vanta")
+	end
+
+-- Wrapped Maintab content in do-end block
+    do -- Maintab
+
+
+        Tabs.Maintab:Section({
+			Title = "Timer"
+		});
+
+				-- ══════════════════════════════════════════════════════════════════
+		-- PLACE ID DETECTION & REMOTE SETUP (runs once at load)
+		-- ══════════════════════════════════════════════════════════════════
+
+		local placeId = game.PlaceId
+		local fireShoot
+
+		if placeId == 115776365257536 then
+			local Event = game:GetService("ReplicatedStorage").RemoteEvent
+			local payload = {
+				{
+					"7",
+					{
+						Shoot = false,
+						Input = "E"
+					}
+				}
+			}
+			fireShoot = function()
+				Event:FireServer(payload)
+			end
+		elseif placeId == 118669925076970 then
+			local Event = game:GetService("ReplicatedStorage").RemoteEvent
+			local payload = {
+				{
+					"5",
+					{
+						Shoot = false,
+						Input = "E"
+					}
+				}
+			}
+			fireShoot = function()
+				Event:FireServer(payload)
+			end
+		else
+			local ShootEvent = game:GetService("ReplicatedStorage")
+				.Aero.AeroRemoteServices.InputService.Shoot
+			local payload = { Shoot = false }
+			fireShoot = function()
+				ShootEvent:FireServer(payload)
+			end
+		end
+
+		-- ══════════════════════════════════════════════════════════════════
+
+		local RunService = game:GetService("RunService")
+		local Players = game:GetService("Players")
+	
+		-- Cache references
+		local player = Players.LocalPlayer
+		local hrp = workspace.Characters[player.Name].HumanoidRootPart
+		local verticalMeter = hrp:WaitForChild("VerticalMeter")
+		local fillGradient = verticalMeter.Meter_Fill.FillGradient
+	
+		-- ══════════════════════════════════════════════════════════════════
+		-- CONFIGURATION
+		-- ══════════════════════════════════════════════════════════════════
+	
+		local CONFIG = {
+			FIRE_AT_Y = -1.35,              -- Y position to fire at
+			LATENCY_COMPENSATION = 0.025,   -- Combined latency bias (25ms)
+			VELOCITY_SAMPLES = 3,           -- Samples for velocity averaging
+			PERFECT_ZONE_Y = -1.4,          -- Perfect shot threshold
+			PERFECT_HOLD_TIME = 0.5,        -- Seconds to hold for perfect
+			MAX_SHOT_DURATION = 2.0,        -- Maximum shot duration in seconds
+			
+			-- Auto Improver Settings
+			AUTO_IMPROVE = true,            -- Toggle auto-improvement on/off
+			TARGET_Y = -1.4,                -- Ideal Y position we want to hit
+			IMPROVE_RATE = 0.025,           -- Learning rate (0-1): how much to trust each shot's calculation
+			IMPROVE_TOLERANCE = 0.05,       -- How close to target is "good enough"
+			MIN_FIRE_Y = -1.6,              -- Lowest FIRE_AT_Y can go
+			MAX_FIRE_Y = -1.0,              -- Highest FIRE_AT_Y can go
+			
+			-- Auto Time Settings
+			AUTO_TIME_ENABLED = false,      -- Toggle for auto time feature
+		}
+	
+		-- ══════════════════════════════════════════════════════════════════
+		-- STATE
+		-- ══════════════════════════════════════════════════════════════════
+	
+		local state = {
+			-- Flags
+			prepared = false,
+			started = false,
+			fired = false,
+			
+			-- Timing
+			startTime = nil,
+			
+			-- Velocity tracking
+			velocitySamples = {},
+			velocity = nil,
+			
+			-- Meter tracking
+			lastY = nil,
+			lastTime = nil,
+			minY = 0,
+			
+			-- Perfect shot
+			perfectEnterTime = nil,
+			isPerfect = false,
+			
+			shotCount = 0,
+			
+			-- Auto Improver tracking
+			firedAtY = nil,
+		}
+	
+		-- Auto Improver stats
+		local improverStats = {
+			totalShots = 0,
+			perfectShots = 0,
+			adjustments = 0,
+		}
+	
+		-- ══════════════════════════════════════════════════════════════════
+		-- AUTO IMPROVER
+		-- ══════════════════════════════════════════════════════════════════
+	
+		local function autoImprove()
+			if not CONFIG.AUTO_IMPROVE or not state.fired or not state.firedAtY then
+				return
+			end
+			
+			improverStats.totalShots = improverStats.totalShots + 1
+			
+			local error = state.minY - CONFIG.TARGET_Y
+			local shotVelocity = state.velocity or 0
+			
+			if math.abs(error) <= CONFIG.IMPROVE_TOLERANCE then
+				improverStats.perfectShots = improverStats.perfectShots + 1
+				return
+			end
+			
+			if shotVelocity <= 0 then
+				return
+			end
+			
+			local idealFireY = state.firedAtY + error
+			local adjustment = (idealFireY - CONFIG.FIRE_AT_Y) * CONFIG.IMPROVE_RATE
+			
+			CONFIG.FIRE_AT_Y = CONFIG.FIRE_AT_Y + adjustment
+			CONFIG.FIRE_AT_Y = math.max(CONFIG.MIN_FIRE_Y, math.min(CONFIG.MAX_FIRE_Y, CONFIG.FIRE_AT_Y))
+			
+			improverStats.adjustments = improverStats.adjustments + 1
+		end
+	
+		local function reset()
+			state.prepared = false
+			state.started = false
+			state.fired = false
+			state.startTime = nil
+			state.velocitySamples = {}
+			state.velocity = nil
+			state.lastY = nil
+			state.lastTime = nil
+			state.minY = 0
+			state.perfectEnterTime = nil
+			state.isPerfect = false
+			state.firedAtY = nil
+		end
+	
+		-- ══════════════════════════════════════════════════════════════════
+		-- VELOCITY & PREDICTION
+		-- ══════════════════════════════════════════════════════════════════
+	
+		local function updateVelocity(deltaY, deltaTime)
+			if deltaY <= 0 or deltaTime <= 0 then return end
+			
+			local v = deltaY / deltaTime
+			local samples = state.velocitySamples
+			
+			table.insert(samples, v)
+			if #samples > CONFIG.VELOCITY_SAMPLES then
+				table.remove(samples, 1)
+			end
+			
+			local sum = 0
+			for i = 1, #samples do
+				sum = sum + samples[i]
+			end
+			state.velocity = sum / #samples
+		end
+	
+		local function shouldFire(currentY, currentTime)
+			if not CONFIG.AUTO_TIME_ENABLED then
+				return false
+			end
+			
+			if not state.velocity or state.velocity <= 0 then
+				return false
+			end
+			
+			if currentY <= CONFIG.FIRE_AT_Y then
+				return true
+			end
+			
+			local distance = math.abs(CONFIG.FIRE_AT_Y - currentY)
+			local timeToTarget = distance / state.velocity
+			
+			return timeToTarget <= CONFIG.LATENCY_COMPENSATION
+		end
+	
+		-- ══════════════════════════════════════════════════════════════════
+		-- ACTIONS
+		-- ══════════════════════════════════════════════════════════════════
+	
+		local function fire(currentY)
+			if state.fired then return end
+			state.fired = true
+			state.firedAtY = currentY
+			
+			fireShoot()
+		end
+	
+		local function checkPerfectZone(currentY, now)
+			if currentY <= CONFIG.PERFECT_ZONE_Y then
+				if not state.perfectEnterTime then
+					state.perfectEnterTime = now
+				elseif not state.isPerfect then
+					local held = now - state.perfectEnterTime
+					if held >= CONFIG.PERFECT_HOLD_TIME then
+						state.isPerfect = true
+					end
+				end
+			elseif state.perfectEnterTime then
+				state.perfectEnterTime = nil
+			end
+		end
+	
+		-- ══════════════════════════════════════════════════════════════════
+		-- MAIN LOOP
+		-- ══════════════════════════════════════════════════════════════════
+	
+		RunService.Heartbeat:Connect(function()
+			local now = os.clock()
+			local enabled = verticalMeter.Enabled
+			
+			if enabled then
+				if not state.prepared then
+					state.prepared = true
+					state.shotCount = state.shotCount + 1
+				end
+			else
+				if state.prepared then
+					if state.started then
+						autoImprove()
+					end
+					reset()
+				end
+				return
+			end
+			
+			local currentY = fillGradient.Offset.Y
+			
+			if state.prepared and not state.started and currentY < 0 then
+				state.started = true
+				state.startTime = now
+				state.lastY = currentY
+				state.lastTime = now
+				state.minY = currentY
+			end
+			
+			if state.started then
+				local duration = now - state.startTime
+				if duration >= CONFIG.MAX_SHOT_DURATION then
+					autoImprove()
+					reset()
+					return
+				end
+			end
+			
+			if state.started and not state.fired then
+				if currentY < state.minY then
+					state.minY = currentY
+				end
+				
+				if currentY ~= state.lastY and state.lastTime then
+					local deltaY = math.abs(currentY - state.lastY)
+					local deltaTime = now - state.lastTime
+					
+					updateVelocity(deltaY, deltaTime)
+					
+					state.lastY = currentY
+					state.lastTime = now
+				end
+				
+				if shouldFire(currentY, now) then
+					fire(currentY)
+				end
+				
+				checkPerfectZone(currentY, now)
+			end
+		end)
+	
+		-- ══════════════════════════════════════════════════════════════════
+		-- UI CONTROLS
+		-- ══════════════════════════════════════════════════════════════════
+	
+		Tabs.Maintab:Toggle({
+			Title = "Auto Time",
+			Default = false,
+			Callback = function(value)
+				CONFIG.AUTO_TIME_ENABLED = value
+			end
+		});
+		
+		Tabs.Maintab:Slider({
+			Title = "Offset",
+			Step = 0.01,
+			Width = 200,
+			Value = {
+				Min = -1.4,
+				Max = -1,
+				Default = -1.35,
+			},
+			Callback = function(value)
+				CONFIG.FIRE_AT_Y = value
+			end
+		});
+
+
+                local Paragraph = Tabs.Maintab:Paragraph({
+        Title = "Steps",
+        Desc = "Use Defualt Shot Meter\n\nFind your own timings.",
+        Locked = false,
+        })
+
+		-- Glide Section
+		Tabs.Maintab:Section({
+			Title = "Glide"
+		});
+		
+		-- Speed variable
+		local spd = 10
+		
+		-- Shot Glide Toggle
+		Tabs.Maintab:Toggle({
+            Flag = "ShotGlideToggle",
+			Title = "Shot Glide",
+			Default = false,
+			Callback = function(enabled)
+				if enabled then
+					-- Roblox script: Continuous CFrame movement for ProxyCharacter with camera-relative direction
+					local p = game:GetService("Players")
+					local uis = game:GetService("UserInputService")
+					local rs = game:GetService("RunService")
+					local plr = p.LocalPlayer
+					local char = workspace:WaitForChild("Characters"):WaitForChild(plr.Name)
+					local h = char:WaitForChild("HumanoidRootPart")
+					local proxy = workspace:WaitForChild("ProxyCharacter")
+					local cam = workspace.CurrentCamera
+					-- Track input
+					local keys = {}
+					local gVec = Vector3.new(0,0,0)
+					local mVec = Vector3.new(0,0,0)
+					-- Keyboard mapping (fixed forward/backward)
+					local keyMap = {
+						[Enum.KeyCode.W] = Vector3.new(0,0,1),   -- Forward
+						[Enum.KeyCode.S] = Vector3.new(0,0,-1),  -- Backward
+						[Enum.KeyCode.A] = Vector3.new(-1,0,0),  -- Left
+						[Enum.KeyCode.D] = Vector3.new(1,0,0),   -- Right
+					}
+					-- Keyboard input
+					local inputBeganConn = uis.InputBegan:Connect(function(i, gp)
+						if gp then return end
+						if keyMap[i.KeyCode] then
+							keys[i.KeyCode] = true
+						end
+					end)
+					local inputEndedConn = uis.InputEnded:Connect(function(i)
+						if keyMap[i.KeyCode] then
+							keys[i.KeyCode] = nil
+						end
+					end)
+					-- Gamepad input
+					local gamepadConn = uis.InputChanged:Connect(function(i)
+						if i.UserInputType == Enum.UserInputType.Gamepad1 or i.UserInputType == Enum.UserInputType.Gamepad2 then
+							if i.KeyCode == Enum.KeyCode.Thumbstick1 then
+								gVec = Vector3.new(i.Position.X, 0, i.Position.Y)
+							end
+						end
+					end)
+					-- Mobile input
+					local mobileConn = uis.InputChanged:Connect(function(i)
+						if i.UserInputType == Enum.UserInputType.Touch then
+							if i.UserInputState == Enum.UserInputState.Change then
+								mVec = Vector3.new(i.Position.X, 0, i.Position.Y)
+							end
+						end
+					end)
+					-- Function to get true camera-relative move direction (like Roblox)
+					local function GetDir()
+						local m = Vector3.new(0,0,0)
+						
+						-- Keyboard
+						for k, _ in pairs(keys) do
+							m = m + keyMap[k]
+						end
+						
+						-- Controller
+						m = m + gVec
+						
+						-- Mobile
+						m = m + mVec
+						
+						if m.Magnitude > 0 then
+							m = m.Unit
+							
+							-- Apply camera rotation like Roblox does
+							local cf = workspace.CurrentCamera.CFrame
+							local look = Vector3.new(cf.LookVector.X, 0, cf.LookVector.Z).Unit
+							local right = cf.RightVector
+							
+							-- Map input vector to camera-relative vector
+							local d = right * m.X + look * m.Z
+							return d.Magnitude > 0 and d.Unit or Vector3.new(0,0,0)
+						end
+						
+						return Vector3.new(0,0,0)
+					end
+					-- Apply movement boost based on camera-relative move direction
+					local renderConn = rs.RenderStepped:Connect(function(dt)
+						-- Only apply speed boost if Action attribute is "Shooting"
+						local act = char:GetAttribute("Action")
+						if act ~= "Shooting" then return end
+						
+						local dir = GetDir()
+						
+						if dir.Magnitude > 0 then
+							proxy.CFrame = proxy.CFrame + (dir * spd * dt)
+						end
+					end)
+					
+					-- Store connections for cleanup
+					_G.ShotGlideConnections = {
+						inputBeganConn,
+						inputEndedConn,
+						gamepadConn,
+						mobileConn,
+						renderConn
+					}
+				else
+					-- Disconnect all connections when toggle is disabled
+					if _G.ShotGlideConnections then
+						for _, conn in ipairs(_G.ShotGlideConnections) do
+							conn:Disconnect()
+						end
+						_G.ShotGlideConnections = nil
+					end
+				end
+			end
+		});
+		
+		-- Speed Slider -- FIXED: Added Flag
+		Tabs.Maintab:Slider({
+			Flag = "ShotGlideSpeedSlider",
+			Title = "Glide Setting",
+			Step = 1,
+			Width = 200,
+			Value = {
+				Min = 1,
+				Max = 20,
+				Default = 10,
+			},
+			Callback = function(value)
+				spd = value
+			end
+		})
+
+		
+	end
+
+
+-- Wrapped Dribbletab content in do-end block
+	do -- Dribbletab
+		local dribbleGlideEnabled = false
+		local moveSpeed = 7
+		
+		Tabs.Dribbletab:Section({
+			Title = "Glide"
+		});
+		
+		Tabs.Dribbletab:Toggle({
+            Flag = "DribbleGlideToggle",
+			Title = "Dribble Glide",
+			Default = false,
+			Callback = function(value)
+				dribbleGlideEnabled = value
+			end
+		});
+		
+		-- FIXED: Added Flag
+		Tabs.Dribbletab:Slider({
+			Flag = "DribbleGlideSpeedSlider",
+			Title = "Glide Setting",
+			Step = 1,
+			Width = 200,
+			Value = {
+				Min = 1,
+				Max = 20,
+				Default = 7,
+			},
+			Callback = function(value)
+				moveSpeed = value
+			end
+		});
+		
+		Tabs.Dribbletab:Section({
+			Title = "Glitch Dribbling"
+		});
+		
+		local dribbleGlitchEnabled = false
+		local spinDuration = 1
+		local pauseDuration = 1
+		local rotSpeed = 5
+		
+		Tabs.Dribbletab:Toggle({
+            Flag = "dribbleglitch",
+			Title = "Dribble Glitch",
+			Default = false,
+			Callback = function(value)
+				dribbleGlitchEnabled = value
+			end
+		});
+		
+		Tabs.Dribbletab:Slider({
+            Flag = "spinslider",
+			Title = "Spin",
+			Step = 0.1,
+			Width = 200,
+			Value = {
+				Min = 0.1,
+				Max = 2,
+				Default = 1,
+			},
+			Callback = function(value)
+				spinDuration = value
+			end
+		});
+		
+		Tabs.Dribbletab:Slider({
+            Flag = "pauseslid",
+			Title = "Pause",
+			Step = 0.1,
+			Width = 200,
+			Value = {
+				Min = 0.1,
+				Max = 2,
+				Default = 1,
+			},
+			Callback = function(value)
+				pauseDuration = value
+			end
+		});
+		
+		Tabs.Dribbletab:Slider({
+            Flag = "glitchslider",
+			Title = "Glitchiness",
+			Step = 1,
+			Width = 200,
+			Value = {
+				Min = 1,
+				Max = 20,
+				Default = 5,
+			},
+			Callback = function(value)
+				rotSpeed = value
+			end
+		});
+		
+		-- Combined Roblox script: Detect Dribbling action attribute and spin ProxyCharacter
+		local PlayersGlitch = game:GetService("Players")
+		local RunServiceGlitch = game:GetService("RunService")
+		
+		local playerGlitch = PlayersGlitch.LocalPlayer
+		local characterGlitch = workspace:WaitForChild("Characters"):WaitForChild(playerGlitch.Name)
+		local proxyCharacterGlitch = workspace:WaitForChild("ProxyCharacter")
+		
+		-- Track if currently spinning
+		local isSpinning = false
+		local isPaused = false
+		local cycleEndTime = 0
+		local isDribbling = false
+		
+		-- Listen for attribute changes
+		characterGlitch.AttributeChanged:Connect(function(attributeName)
+			if attributeName == "Action" then
+				local value = characterGlitch:GetAttribute("Action")
+				
+				if value == "Dribbling" then
+					isDribbling = true
+					-- Start spinning if not already in a cycle
+					if not isSpinning and not isPaused then
+						isSpinning = true
+						cycleEndTime = tick() + spinDuration
+					end
+				else
+					isDribbling = false
+				end
+			end
+		end)
+		
+		-- Apply spinning rotation
+		RunServiceGlitch.RenderStepped:Connect(function()
+			if not dribbleGlitchEnabled then return end
+			
+			if isSpinning then
+				-- Check if spin duration has elapsed
+				if tick() >= cycleEndTime then
+					isSpinning = false
+					isPaused = true
+					cycleEndTime = tick() + pauseDuration
+				else
+					-- Apply rotation to ProxyCharacter
+					proxyCharacterGlitch.CFrame = proxyCharacterGlitch.CFrame * CFrame.Angles(0, math.rad(rotSpeed % 150), 0)
+				end
+			elseif isPaused then
+				-- Check if pause duration has elapsed
+				if tick() >= cycleEndTime then
+					isPaused = false
+					-- If still dribbling, start another spin cycle
+					if isDribbling then
+						isSpinning = true
+						cycleEndTime = tick() + spinDuration
+					end
+				end
+			end
+		end)
+		
+		Tabs.Dribbletab:Section({
+			Title = "Speed"
+		});
+		
+		local dribbleSpeedEnabled = false
+		local dribbleSpeedMultiplier = 5
+		
+		-- FIXED: Added Flag
+		Tabs.Dribbletab:Toggle({
+			Flag = "HandlesSpeedToggle",
+			Title = "Handles Speed",
+			Default = false,
+			Callback = function(value)
+				dribbleSpeedEnabled = value
+			end
+		});
+		
+		-- FIXED: Added Flag
+		Tabs.Dribbletab:Slider({
+			Flag = "HandlesSpeedMultiplierSlider",
+			Title = "Multiplier",
+			Step = 0.5,
+			Width = 200,
+			Value = {
+				Min = 1,
+				Max = 10,
+				Default = 5,
+			},
+			Callback = function(value)
+				dribbleSpeedMultiplier = value
+			end
+		});
+		
+		-- Dribble Speed script
+		local PlayersSpeed = game:GetService("Players")
+		local RunServiceSpeed = game:GetService("RunService")
+
+		local playerSpeed = PlayersSpeed.LocalPlayer
+		local characterSpeed = workspace:WaitForChild("Characters"):WaitForChild(playerSpeed.Name)
+		local humanoidSpeed = characterSpeed:WaitForChild("Humanoid")
+
+		-- Track dribbling
+		local isDribblingSpeed = false
+
+		-- Function to update animation speeds
+		local function updateAnimationSpeed()
+			if not dribbleSpeedEnabled then return end
+			
+			if isDribblingSpeed then
+				for _, track in pairs(humanoidSpeed:GetPlayingAnimationTracks()) do
+					track:AdjustSpeed(dribbleSpeedMultiplier)
+				end
+			end
+		end
+
+		-- Listen for Action attribute changes
+		characterSpeed.AttributeChanged:Connect(function(attributeName)
+			if attributeName == "Action" then
+				local value = characterSpeed:GetAttribute("Action")
+				isDribblingSpeed = (value == "Dribbling")
+				updateAnimationSpeed()
+			end
+		end)
+
+		-- Continuously update (optional, in case new animations start playing)
+		RunServiceSpeed.RenderStepped:Connect(updateAnimationSpeed)
+		
+		-- Roblox script: Continuous CFrame movement for ProxyCharacter with camera-relative direction
+		local PlayersGlide = game:GetService("Players")
+		local UserInputService = game:GetService("UserInputService")
+		local RunServiceGlide = game:GetService("RunService")
+
+		local playerGlide = PlayersGlide.LocalPlayer
+		local characterGlide = workspace:WaitForChild("Characters"):WaitForChild(playerGlide.Name)
+		local hrpGlide = characterGlide:WaitForChild("HumanoidRootPart")
+		local proxyCharacterGlide = workspace:WaitForChild("ProxyCharacter")
+		local cameraGlide = workspace.CurrentCamera
+
+		-- Track input
+		local pressedKeys = {}
+		local gamepadVector = Vector3.new(0,0,0)
+		local mobileVector = Vector3.new(0,0,0)
+
+		-- Keyboard mapping (fixed forward/backward)
+		local keyDirectionMap = {
+			[Enum.KeyCode.W] = Vector3.new(0,0,1),   -- Forward
+			[Enum.KeyCode.S] = Vector3.new(0,0,-1),  -- Backward
+			[Enum.KeyCode.A] = Vector3.new(-1,0,0),  -- Left
+			[Enum.KeyCode.D] = Vector3.new(1,0,0),   -- Right
+		}
+
+		-- Keyboard input
+		UserInputService.InputBegan:Connect(function(input, gameProcessed)
+			if gameProcessed then return end
+			if keyDirectionMap[input.KeyCode] then
+				pressedKeys[input.KeyCode] = true
+			end
+		end)
+
+		UserInputService.InputEnded:Connect(function(input)
+			if keyDirectionMap[input.KeyCode] then
+				pressedKeys[input.KeyCode] = nil
+			end
+		end)
+
+		-- Gamepad input
+		UserInputService.InputChanged:Connect(function(input)
+			if input.UserInputType == Enum.UserInputType.Gamepad1 or input.UserInputType == Enum.UserInputType.Gamepad2 then
+				if input.KeyCode == Enum.KeyCode.Thumbstick1 then
+					gamepadVector = Vector3.new(input.Position.X, 0, input.Position.Y)
+				end
+			end
+		end)
+
+		-- Mobile input
+		UserInputService.InputChanged:Connect(function(input)
+			if input.UserInputType == Enum.UserInputType.Touch then
+				if input.UserInputState == Enum.UserInputState.Change then
+					mobileVector = Vector3.new(input.Position.X, 0, input.Position.Y)
+				end
+			end
+		end)
+
+		-- Function to get true camera-relative move direction (like Roblox)
+		local function GetTrueMoveDirection()
+			local move = Vector3.new(0,0,0)
+			
+			-- Keyboard
+			for key, _ in pairs(pressedKeys) do
+				move = move + keyDirectionMap[key]
+			end
+			
+			-- Controller
+			move = move + gamepadVector
+			
+			-- Mobile
+			move = move + mobileVector
+			
+			if move.Magnitude > 0 then
+				move = move.Unit
+				
+				-- Apply camera rotation like Roblox does
+				local camCF = workspace.CurrentCamera.CFrame
+				local camLook = Vector3.new(camCF.LookVector.X, 0, camCF.LookVector.Z).Unit
+				local camRight = camCF.RightVector
+				
+				-- Map input vector to camera-relative vector
+				local dir = camRight * move.X + camLook * move.Z
+				return dir.Magnitude > 0 and dir.Unit or Vector3.new(0,0,0)
+			end
+			
+			return Vector3.new(0,0,0)
+		end
+
+		-- Apply movement boost based on camera-relative move direction
+		RunServiceGlide.RenderStepped:Connect(function(deltaTime)
+			if not dribbleGlideEnabled then return end
+			
+			-- Only apply speed boost if Action attribute is "Dribbling"
+			local action = characterGlide:GetAttribute("Action")
+			if action ~= "Dribbling" then return end
+			
+			local trueDir = GetTrueMoveDirection()
+			
+			if trueDir.Magnitude > 0 then
+				proxyCharacterGlide.CFrame = proxyCharacterGlide.CFrame + (trueDir * moveSpeed * deltaTime)
+			end
+		end)
+	end
+
+
+    -- Wrapped PlayerTab content in do-end block
+    do -- PlayerTab
+	local RunService = game:GetService("RunService")
+	local Players = game:GetService("Players")
+	local player = Players.LocalPlayer
+	local charName = player.Name
+	local character = workspace.Characters:WaitForChild(charName)
+	
+	-- Walkspeed variables
+	local walkspeedEnabled = false
+	local WALK_SPEED = 20
+	
+	-- Stamina variables
+	local staminaEnabled = false
+	local STAMINA = 100
+	local staminaLoop = nil
+	
+    	-- Section divider
+	Tabs.PlayerTab:Section({
+		Title = "Speed"
+	});
+
+
+	-- Walkspeed Toggle
+	Tabs.PlayerTab:Toggle({
+		Flag = "WalkspeedToggle",
+		Title = "Walkspeed",
+		Default = false,
+		Callback = function(enabled)
+			walkspeedEnabled = enabled
+			-- Set walkspeed once when enabled instead of continuous loop
+			if enabled then
+				pcall(function()
+					character:SetAttribute("WalkSpeed", WALK_SPEED)
+				end)
+			end
+		end
+	});
+	
+	-- Walkspeed Slider
+	Tabs.PlayerTab:Slider({
+		Flag = "WalkspeedSlider",
+		Title = "Amount",
+		Step = 1,
+		Width = 200,
+		Value = {
+			Min = 10,
+			Max = 20,
+			Default = 14,
+		},
+		Callback = function(value)
+			WALK_SPEED = value
+			-- Set walkspeed immediately when slider changes (if enabled)
+			if walkspeedEnabled then
+				pcall(function()
+					character:SetAttribute("WalkSpeed", WALK_SPEED)
+				end)
+			end
+		end
+	});
+	
+	-- Section divider
+	Tabs.PlayerTab:Section({
+		Title = "Stamina"
+	});
+	
+	-- Inf Stamina Toggle
+	Tabs.PlayerTab:Toggle({
+		Flag = "InfStaminaToggle",
+		Title = "Inf Stamina",
+		Default = false,
+		Callback = function(enabled)
+			staminaEnabled = enabled
+			if enabled then
+				staminaLoop = RunService.Heartbeat:Connect(function()
+					if staminaEnabled then
+						pcall(function()
+							if character:GetAttribute("Stamina") ~= STAMINA then
+								character:SetAttribute("Stamina", STAMINA)
+							end
+						end)
+					end
+				end)
+			else
+				if staminaLoop then
+					staminaLoop:Disconnect()
+					staminaLoop = nil
+				end
+			end
+		end
+	});
+end
+
+
+
+
+-- Wrapped DefenseTab content in do-end block
+
+-- DefenseTab
+     do 
+		-- Guarding Section
+		Tabs.DefenseTab:Section({
+			Title = "Guarding"
+		})
+
+		local AutoGuardToggle = Tabs.DefenseTab:Toggle({
+			Title = "Auto Guard",
+			Value = false,
+			Flag = "AutoGuardToggle",
+			Callback = function(Value)
+				if Value then
+					-- AUTO GUARD (VirtualInput WASD + Attribute Guard Detection + WalkSpeed)
+					local players = game:GetService("Players")
+					local client = players.LocalPlayer
+					local virtualinputmanager = game:GetService("VirtualInputManager")
+					local RunService = game:GetService("RunService")
+
+					-- Use config values from sliders
+					local GUARD_DISTANCE = getgenv().GuardDistanceValue or 5.5
+					local BALL_DETECTION_RANGE = 25
+					local TOLERANCE = 0.3
+					local PREDICTION_FACTOR = getgenv().PredictionFactorValue or 0.2
+
+					-- Store original WalkSpeed
+					local originalWalkSpeed = nil
+
+					-- Utilities
+					local function get_char(player)
+						local chars = workspace:FindFirstChild("Characters")
+						if not chars then return nil end
+						return chars:FindFirstChild(player.Name)
+					end
+
+					local function get_root(char)
+						return char and char:FindFirstChild("HumanoidRootPart")
+					end
+
+					local function get_hum(char)
+						return char and char:FindFirstChildWhichIsA("Humanoid")
+					end
+
+					-- Calculate guard position
+					local function CalculateGuardPosition(ballHolderRoot, rimPosition, myRoot)
+						local GUARD_DISTANCE = getgenv().GuardDistanceValue or 5.5
+						local PREDICTION_FACTOR = getgenv().PredictionFactorValue or 0.2
+						
+						local ballPos = ballHolderRoot.Position
+						local myPos = myRoot.Position
+						local velocity = ballHolderRoot.AssemblyLinearVelocity
+						local horizontalVelocity = Vector3.new(velocity.X, 0, velocity.Z)
+						local speed = horizontalVelocity.Magnitude
+						
+						local ballToRim = rimPosition - ballPos
+						local horizontalBallToRim = Vector3.new(ballToRim.X, 0, ballToRim.Z)
+						
+						if horizontalBallToRim.Magnitude == 0 then
+							return ballPos
+						end
+						
+						local laneDirection = horizontalBallToRim.Unit
+						local baseGuardPos = ballPos + (laneDirection * GUARD_DISTANCE)
+						
+						local predictionScale = math.clamp(speed / 20, 0, 1) * PREDICTION_FACTOR
+						local predictedOffset = horizontalVelocity * predictionScale
+						local finalPos = baseGuardPos + predictedOffset
+						
+						local predictedBallPos = ballPos + predictedOffset
+						local correctedDirection = (rimPosition - predictedBallPos)
+						local horizontalCorrectedDir = Vector3.new(correctedDirection.X, 0, correctedDirection.Z)
+						
+						if horizontalCorrectedDir.Magnitude > 0 then
+							finalPos = predictedBallPos + (horizontalCorrectedDir.Unit * GUARD_DISTANCE)
+						end
+						
+						finalPos = Vector3.new(finalPos.X, ballPos.Y, finalPos.Z)
+						return finalPos
+					end
+
+					-- Attribute-based guarding detection
+					local function is_guarding_by_attribute(char)
+						if not char then return false end
+						local holdingG = char:GetAttribute("HoldingG")
+						return holdingG == true
+					end
+
+					-- Find closest rim
+					local function get_closest_rim(rims, position)
+						local dist, closest = math.huge, nil
+						for _, rim in ipairs(rims) do
+							local d = (rim:GetPivot().Position - position).Magnitude
+							if d < dist then
+								dist = d
+								closest = rim
+							end
+						end
+						return closest
+					end
+
+					-- Rim detection
+					local rims = {}
+					for _, obj in workspace:GetDescendants() do
+						if obj:IsA("MeshPart") and obj.Name == "Rim" then
+							table.insert(rims, obj)
+						end
+					end
+
+					-- Track pressed keys
+					local pressedKeys = {
+						[Enum.KeyCode.W] = false,
+						[Enum.KeyCode.A] = false,
+						[Enum.KeyCode.S] = false,
+						[Enum.KeyCode.D] = false,
+					}
+
+					local lastForwardKey = nil
+					local lastRightKey = nil
+
+					local function releaseAllKeys()
+						for key, _ in pairs(pressedKeys) do
+							pcall(function()
+								virtualinputmanager:SendKeyEvent(false, key, false, game)
+							end)
+							pressedKeys[key] = false
+						end
+						lastForwardKey = nil
+						lastRightKey = nil
+					end
+
+					local function sendKey(key, isDown)
+						if pressedKeys[key] == isDown then return end
+						pcall(function()
+							virtualinputmanager:SendKeyEvent(isDown, key, false, game)
+						end)
+						pressedKeys[key] = isDown
+					end
+
+					-- Movement state
+					local lastGuardState = false
+					local wasControllingMovement = false
+
+					-- WalkSpeed enforcement
+					local walkSpeedConnection = nil
+
+					local function startWalkSpeedEnforcement()
+						if walkSpeedConnection then return end
+						
+						local char = get_char(client)
+						if not char then return end
+						
+						-- Save original WalkSpeed when first starting to guard
+						if originalWalkSpeed == nil then
+							originalWalkSpeed = char:GetAttribute("WalkSpeed")
+						end
+						
+						walkSpeedConnection = RunService.Heartbeat:Connect(function()
+							local char = get_char(client)
+							if not char then return end
+							
+							local WALK_SPEED = getgenv().MoveSpeedValue or 20
+							if char:GetAttribute("WalkSpeed") ~= WALK_SPEED then
+								char:SetAttribute("WalkSpeed", WALK_SPEED)
+							end
+						end)
+					end
+
+					local function stopWalkSpeedEnforcement()
+						if walkSpeedConnection then
+							walkSpeedConnection:Disconnect()
+							walkSpeedConnection = nil
+						end
+						
+						-- Restore original WalkSpeed
+						if originalWalkSpeed ~= nil then
+							local char = get_char(client)
+							if char then
+								char:SetAttribute("WalkSpeed", originalWalkSpeed)
+							end
+							originalWalkSpeed = nil
+						end
+					end
+
+					local function move_to_position_wasd(char, targetPosition)
+						local root = char:FindFirstChild("HumanoidRootPart")
+						if not root then 
+							releaseAllKeys()
+							return 
+						end
+						
+						local TOLERANCE = 0.3
+						
+						local direction = (targetPosition - root.Position)
+						local horizontalDirection = Vector3.new(direction.X, 0, direction.Z)
+						
+						if horizontalDirection.Magnitude <= TOLERANCE then
+							releaseAllKeys()
+							return
+						end
+
+						local moveVector = horizontalDirection.Unit
+						local cam = workspace.CurrentCamera
+						if not cam then 
+							releaseAllKeys()
+							return 
+						end
+
+						local camCF = cam.CFrame
+						local camRight = camCF.RightVector
+						local camLook = Vector3.new(camCF.LookVector.X, 0, camCF.LookVector.Z).Unit
+
+						local forward = moveVector:Dot(camLook)
+						local right = moveVector:Dot(camRight)
+
+						local activateThreshold = 0.2
+						local deactivateThreshold = 0.08
+
+						local newForwardKey = lastForwardKey
+						if forward > activateThreshold then
+							newForwardKey = Enum.KeyCode.W
+						elseif forward < -activateThreshold then
+							newForwardKey = Enum.KeyCode.S
+						elseif math.abs(forward) < deactivateThreshold then
+							newForwardKey = nil
+						end
+
+						if newForwardKey ~= lastForwardKey then
+							if lastForwardKey then sendKey(lastForwardKey, false) end
+							if newForwardKey then sendKey(newForwardKey, true) end
+							lastForwardKey = newForwardKey
+						end
+
+						local newRightKey = lastRightKey
+						if right > activateThreshold then
+							newRightKey = Enum.KeyCode.D
+						elseif right < -activateThreshold then
+							newRightKey = Enum.KeyCode.A
+						elseif math.abs(right) < deactivateThreshold then
+							newRightKey = nil
+						end
+
+						if newRightKey ~= lastRightKey then
+							if lastRightKey then sendKey(lastRightKey, false) end
+							if newRightKey then sendKey(newRightKey, true) end
+							lastRightKey = newRightKey
+						end
+					end
+
+					-- AUTO GUARD LOOP
+					local loopConnection = RunService.Heartbeat:Connect(function()
+						local char = get_char(client)
+						local root = get_root(char)
+						local hum = get_hum(char)
+
+						if not (char and root and hum) then 
+							releaseAllKeys()
+							stopWalkSpeedEnforcement()
+							wasControllingMovement = false
+							return 
+						end
+
+						local currentGuardState = is_guarding_by_attribute(char)
+
+						if lastGuardState and not currentGuardState then
+							releaseAllKeys()
+							stopWalkSpeedEnforcement()
+							wasControllingMovement = false
+						end
+
+						lastGuardState = currentGuardState
+
+						local player_with_ball = (function()
+							local basketballsFolder = workspace:FindFirstChild("Basketballs")
+							if not basketballsFolder then return nil end
+							
+							local closestBall = nil
+							local closestBallDist = math.huge
+							
+							for _, ball in ipairs(basketballsFolder:GetChildren()) do
+								if ball:IsA("BasePart") then
+									local d = (ball.Position - root.Position).Magnitude
+									if d <= BALL_DETECTION_RANGE and d < closestBallDist then
+										closestBallDist = d
+										closestBall = ball
+									end
+								end
+							end
+							
+							if not closestBall then return nil end
+							
+							local chars = workspace:FindFirstChild("Characters")
+							if not chars then return nil end
+							
+							local closestPlayer = nil
+							local closestPlayerDist = math.huge
+							
+							for _, plr in players:GetPlayers() do
+								if plr == client then continue end
+								local p_char = chars:FindFirstChild(plr.Name)
+								local p_root = p_char and p_char:FindFirstChild("HumanoidRootPart")
+								
+								if p_root then
+									local distToBall = (p_root.Position - closestBall.Position).Magnitude
+									
+									if distToBall < closestPlayerDist then
+										closestPlayerDist = distToBall
+										closestPlayer = p_char
+									end
+								end
+							end
+							
+							if not closestPlayer then return nil end
+							
+							local attributesFolder = closestPlayer:FindFirstChild("Attributes")
+							local basketball = attributesFolder and attributesFolder:FindFirstChild("Basketball")
+							local has_ball = basketball and basketball:IsA("ObjectValue")
+							
+							if has_ball then
+								return closestPlayer
+							else
+								return nil
+							end
+						end)()
+
+						if player_with_ball and currentGuardState then
+							wasControllingMovement = true
+							startWalkSpeedEnforcement()
+
+							local ballHolderRoot = player_with_ball:FindFirstChild("HumanoidRootPart")
+							if ballHolderRoot then
+								local closest_rim = get_closest_rim(rims, ballHolderRoot.Position)
+								if closest_rim then
+									local rimPosition = closest_rim:GetPivot().Position
+									local target_position = CalculateGuardPosition(ballHolderRoot, rimPosition, root)
+									move_to_position_wasd(char, target_position)
+								end
+							end
+						else
+							if wasControllingMovement then
+								releaseAllKeys()
+								stopWalkSpeedEnforcement()
+								wasControllingMovement = false
+							end
+						end
+					end)
+
+					-- Store connections for cleanup
+					getgenv().AutoGuardLoopConnection = loopConnection
+					getgenv().AutoGuardWalkSpeedConnection = walkSpeedConnection
+					getgenv().AutoGuardReleaseKeys = releaseAllKeys
+					getgenv().AutoGuardStopWalkSpeed = stopWalkSpeedEnforcement
+
+				else
+					-- Cleanup when toggle is off
+					if getgenv().AutoGuardLoopConnection then
+						getgenv().AutoGuardLoopConnection:Disconnect()
+						getgenv().AutoGuardLoopConnection = nil
+					end
+					if getgenv().AutoGuardWalkSpeedConnection then
+						getgenv().AutoGuardWalkSpeedConnection:Disconnect()
+						getgenv().AutoGuardWalkSpeedConnection = nil
+					end
+					if getgenv().AutoGuardStopWalkSpeed then
+						getgenv().AutoGuardStopWalkSpeed()
+						getgenv().AutoGuardStopWalkSpeed = nil
+					end
+					if getgenv().AutoGuardReleaseKeys then
+						getgenv().AutoGuardReleaseKeys()
+						getgenv().AutoGuardReleaseKeys = nil
+					end
+				end
+			end
+		})
+
+		-- Configuration sliders
+		Tabs.DefenseTab:Slider({
+			Title = "Guard Distance",
+			Step = 1,
+			Width = 200,
+			Value = {
+				Min = 1,
+				Max = 15,
+				Default = 5.5,
+			},
+			Flag = "GuardDistanceSlider",
+			Callback = function(value)
+				getgenv().GuardDistanceValue = value
+			end
+		})
+
+		Tabs.DefenseTab:Slider({
+			Title = "Move Speed",
+			Step = 1,
+			Width = 200,
+			Value = {
+				Min = 13,
+				Max = 20,
+				Default = 15,
+			},
+			Flag = "MoveSpeedSlider",
+			Callback = function(value)
+				getgenv().MoveSpeedValue = value
+			end
+		})
+
+		Tabs.DefenseTab:Slider({
+			Title = "Prediction",
+			Step = 0.01,
+			Width = 200,
+			Value = {
+				Min = 0,
+				Max = 1,
+				Default = 0.2,
+			},
+			Flag = "PredictionFactorSlider",
+			Callback = function(value)
+				getgenv().PredictionFactorValue = value
+			end
+		})
+
+        local Paragraph = Tabs.DefenseTab:Paragraph({
+        Title = "Steps",
+        Desc = "Made for PC. May be bugged on mobile.",
+        Locked = false,
+        })
+        
+		-- Experimental Section
+		Tabs.DefenseTab:Section({
+			Title = "Experimental"
+		});
+		
+		-- FIXED: Added Flag
+		Tabs.DefenseTab:Toggle({
+			Flag = "AutoContestToggle",
+			Title = "Auto Contest",
+			Default = false,
+			Callback = function(enabled)
+				if enabled then
+					local Players = game:GetService("Players")
+					local RunService = game:GetService("RunService")
+					local lp = Players.LocalPlayer
+					local char = workspace.Characters:WaitForChild(lp.Name)
+					-- Get ProxyCharacter
+					local proxyChar = workspace:WaitForChild("ProxyCharacter")
+					local LERP_SPEED = 0.015
+					local FRONT_OFFSET = 0.1
+					local RANGE = 20 -- only activate within this many studs
+					-- lock Y position (using ProxyCharacter's initial Y position)
+					local LOCKED_Y = proxyChar.Position.Y
+					local function isHoldingG()
+						return char:GetAttribute("HoldingG") == true
+					end
+					local function getClosestPlayer()
+						local closest
+						local dist = math.huge
+						for _, p in ipairs(Players:GetPlayers()) do
+							if p ~= lp then
+								local charModel = workspace.Characters:FindFirstChild(p.Name)
+								if charModel and charModel:FindFirstChild("HumanoidRootPart") then
+									local root = charModel.HumanoidRootPart
+									local d = (proxyChar.Position - root.Position).Magnitude
+									if d < dist then
+										dist = d
+										closest = p
+									end
+								end
+							end
+						end
+						return closest, dist
+					end
+					local function isActionShootingOrDunking(player)
+						local charModel = workspace.Characters:FindFirstChild(player.Name)
+						if not charModel then return false end
+						local action = charModel:GetAttribute("Action")
+						if action == "Shooting" or action == "Dunking" then
+							return true
+						end
+						return false
+					end
+					_G.autoContestConnection = RunService.Heartbeat:Connect(function()
+						if not isHoldingG() then return end
+						local targetPlayer, dist = getClosestPlayer()
+						if not targetPlayer then return end
+						if dist > RANGE then return end
+						if not isActionShootingOrDunking(targetPlayer) then return end
+						local targetRoot = workspace.Characters[targetPlayer.Name].HumanoidRootPart
+						local facePos = targetRoot.Position + (targetRoot.CFrame.LookVector * FRONT_OFFSET)
+						-- lock Y position
+						facePos = Vector3.new(facePos.X, LOCKED_Y, facePos.Z)
+						local goal = CFrame.new(
+							facePos,
+							Vector3.new(targetRoot.Position.X, LOCKED_Y, targetRoot.Position.Z)
+						)
+						proxyChar.CFrame = proxyChar.CFrame:Lerp(goal, LERP_SPEED)
+					end)
+				else
+					if _G.autoContestConnection then
+						_G.autoContestConnection:Disconnect()
+						_G.autoContestConnection = nil
+					end
+				end
+			end
+		})
+
+
+                local Paragraph = Tabs.DefenseTab:Paragraph({
+        Title = "Disclamer",
+        Desc = "Only works with your hands out. Dont Jump.",
+        Locked = false,
+        })     
+
+	end
+
+
+
+
+-- Wrapped MiscTab content in do-end block
+do -- MiscTab
+
+		Tabs.MiscTab:Section({
+			Title = "Fps"
+		});
+
+	Tabs.MiscTab:Button({
+		Title = "FPS Booster",
+		Locked = false,
+		Callback = function()
+			_G.Ignore = {}
+			_G.Settings = {
+				Players = {
+					["Ignore Me"] = true,
+					["Ignore Others"] = true,
+					["Ignore Tools"] = true
+				},
+				Meshes = {
+					NoMesh = false,
+					NoTexture = false,
+					Destroy = false
+				},
+				Images = {
+					Invisible = true,
+					Destroy = false
+				},
+				Explosions = {
+					Smaller = true,
+					Invisible = false, -- Not for PVP games
+					Destroy = false -- Not for PVP games
+				},
+				Particles = {
+					Invisible = true,
+					Destroy = false
+				},
+				TextLabels = {
+					LowerQuality = true,
+					Invisible = false,
+					Destroy = false
+				},
+				MeshParts = {
+					LowerQuality = true,
+					Invisible = false,
+					NoTexture = false,
+					NoMesh = false,
+					Destroy = false
+				},
+				Other = {
+					["FPS Cap"] = 360, -- true to uncap
+					["No Camera Effects"] = true,
+					["No Clothes"] = true,
+					["Low Water Graphics"] = true,
+					["No Shadows"] = true,
+					["Low Rendering"] = true,
+					["Low Quality Parts"] = true,
+					["Low Quality Models"] = true,
+					["Reset Materials"] = true,
+				}
+			}
+			loadstring(game:HttpGet("https://raw.githubusercontent.com/CasperFlyModz/discord.gg-rips/main/FPSBooster.lua"))()
+		end
+	})
+
+end
+
+
+
+
+	-- Window Settings Tab
+	do
+		Tabs.WindowTab:Section({
+			Title = "Window"
+		});
+		
+		local themeValues = {};
+		for name, _ in pairs(WindUI:GetThemes()) do
+			table.insert(themeValues, name);
+		end
+		
+		local themeDropdown = Tabs.WindowTab:Dropdown({
+			Title = "Select Theme",
+			Multi = false,
+			AllowNone = false,
+			Value = nil,
+			Values = themeValues,
+			Callback = function(theme)
+				WindUI:SetTheme(theme);
+			end
+		});
+		themeDropdown:Select(WindUI:GetCurrentTheme());
+		
+		-- Config Section
+		Tabs.WindowTab:Section({
+			Title = "Configuration"
+		});
+		
+		local ConfigManager = Window.ConfigManager
+		local AllConfigs = ConfigManager:AllConfigs()
+		local ConfigName = AllConfigs[1]
+
+		-- Auto-load first available config
+		if ConfigName then
+			local myConfig = ConfigManager:CreateConfig(ConfigName)
+			myConfig:Load()
+		end
+
+		local ConfigNameInput = Tabs.WindowTab:Input({
+			Title = "Config Name",
+			Icon = "file-cog",
+			Placeholder = "Enter config name...",
+			Value = ConfigName,
+			Callback = function(value)
+				ConfigName = value
+			end
+		})
+
+		Tabs.WindowTab:Space()
+		
+		local DefaultValue = table.find(AllConfigs, ConfigName) and ConfigName or nil
+
+		local AllConfigsDropdown = Tabs.WindowTab:Dropdown({
+			Title = "All Configs",
+			Desc = "Select existing configs",
+			Values = AllConfigs,
+			Value = DefaultValue,
+			Callback = function(value)
+				ConfigName = value
+				ConfigNameInput:Set(value)
+			end
+		})
+
+		Tabs.WindowTab:Space()
+
+		Tabs.WindowTab:Button({
+			Title = "Save Config",
+			Icon = "save",
+			Justify = "Center",
+			Callback = function()
+				Window.CurrentConfig = ConfigManager:Config(ConfigName)
+				if Window.CurrentConfig:Save() then
+					WindUI:Notify({
+						Title = "Config Saved",
+						Desc = "Config '" .. ConfigName .. "' saved successfully",
+						Icon = "check",
+					})
+				end
+				
+				AllConfigsDropdown:Refresh(ConfigManager:AllConfigs())
+			end
+		})
+
+		Tabs.WindowTab:Space()
+
+		Tabs.WindowTab:Button({
+			Title = "Load Config",
+			Icon = "refresh-cw",
+			Justify = "Center",
+			Callback = function()
+				Window.CurrentConfig = ConfigManager:CreateConfig(ConfigName)
+				if Window.CurrentConfig:Load() then
+					WindUI:Notify({
+						Title = "Config Loaded",
+						Desc = "Config '" .. ConfigName .. "' loaded successfully",
+						Icon = "check",
+					})
+				end
+			end
+		})
+
+		Tabs.WindowTab:Space()
+
+		Tabs.WindowTab:Button({
+			Title = "Delete Config",
+			Icon = "trash-2",
+			Justify = "Center",
+			Callback = function()
+				if ConfigManager:DeleteConfig(ConfigName) then
+					WindUI:Notify({
+						Title = "Config Deleted",
+						Desc = "Config '" .. ConfigName .. "' has been deleted",
+						Icon = "trash",
+					})
+					AllConfigsDropdown:Refresh(ConfigManager:AllConfigs())
+				else
+					WindUI:Notify({
+						Title = "Error",
+						Desc = "Failed to delete config '" .. ConfigName .. "'",
+						Icon = "x",
+					})
+				end
+			end
+		})
+		
+		-- Keybind Section
+		Tabs.WindowTab:Section({
+			Title = "Keybind"
+		});
+		
+		Tabs.WindowTab:Keybind({
+			Flag = "UIToggleKey",
+			Title = "Toggle UI",
+			Desc = "Keybind to open/close UI",
+			Value = "RightShift",
+			Callback = function(v)
+				Window:SetToggleKey(Enum.KeyCode[v])
+			end
+		})
+	end
+    end
