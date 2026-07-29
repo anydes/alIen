@@ -111,16 +111,32 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 			Title = "Timer"
 		});
 
-				-- ══════════════════════════════════════════════════════════════════
-		-- PLACE ID DETECTION & REMOTE SETUP (runs once at load)
-		-- ══════════════════════════════════════════════════════════════════
+-- ══════════════════════════════════════════════════════════════════
+-- REMOTE DETECTION (no PlaceId checks)
+-- ══════════════════════════════════════════════════════════════════
 
-		local placeId = game.PlaceId
-		local fireShoot
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local fireShoot
 
-		if placeId == 115776365257536 then
-			local Event = game:GetService("ReplicatedStorage").RemoteEvent
-			local payload = {
+-- Try the Aero Shoot remote first
+local ok, ShootEvent = pcall(function()
+	return ReplicatedStorage.Aero.AeroRemoteServices.InputService.Shoot
+end)
+
+if ok and ShootEvent then
+	local payload = { Shoot = false }
+
+	fireShoot = function()
+		ShootEvent:FireServer(payload)
+	end
+else
+	-- Fallback to the generic RemoteEvent
+	local Event = ReplicatedStorage:FindFirstChild("RemoteEvent")
+
+	if Event then
+		-- Try known payloads
+		local payloads = {
+			{
 				{
 					"7",
 					{
@@ -128,13 +144,8 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 						Input = "E"
 					}
 				}
-			}
-			fireShoot = function()
-				Event:FireServer(payload)
-			end
-		elseif placeId == 118669925076970 then
-			local Event = game:GetService("ReplicatedStorage").RemoteEvent
-			local payload = {
+			},
+			{
 				{
 					"5",
 					{
@@ -143,17 +154,20 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 					}
 				}
 			}
-			fireShoot = function()
-				Event:FireServer(payload)
-			end
-		else
-			local ShootEvent = game:GetService("ReplicatedStorage")
-				.Aero.AeroRemoteServices.InputService.Shoot
-			local payload = { Shoot = false }
-			fireShoot = function()
-				ShootEvent:FireServer(payload)
+		}
+
+		fireShoot = function()
+			for _, payload in ipairs(payloads) do
+				pcall(function()
+					Event:FireServer(payload)
+				end)
 			end
 		end
+	else
+		warn("No supported shoot remote found.")
+		fireShoot = function() end
+	end
+end
 
 		-- ══════════════════════════════════════════════════════════════════
 
