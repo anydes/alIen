@@ -438,7 +438,7 @@ end
 		Tabs.Maintab:Slider({
 			Title = "Offset",
 			Step = 0.01,
-			Width 0,
+			Width = 200,
 			Value = {
 				Min = -1.4,
 				Max = -1,
@@ -587,7 +587,7 @@ end
 			Flag = "ShotGlideSpeedSlider",
 			Title = "Glide Setting",
 			Step = 1,
-			Width 0,
+			Width = 200,
 			Value = {
 				Min = 1,
 				Max = 20,
@@ -976,7 +976,7 @@ end
 		Width = 200,
 		Value = {
 			Min = 10,
-			Max = 40,
+			Max = 20,
 			Default = 14,
 		},
 		Callback = function(value)
