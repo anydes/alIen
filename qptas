@@ -590,7 +590,7 @@ end
 			Width = 200,
 			Value = {
 				Min = 1,
-				Max = 20,
+				Max = 10,
 				Default = 10,
 			},
 			Callback = function(value)
@@ -598,7 +598,266 @@ end
 			end
 		})
 
-		
+		-- Gather Glide speed variable
+		local gatherSpd = 7
+
+		-- Gather Glide Toggle
+		Tabs.Maintab:Toggle({
+			Flag = "GatherGlideToggle",
+			Title = "Gather Glide",
+			Default = false,
+			Callback = function(enabled)
+				if enabled then
+					local p = game:GetService("Players")
+					local uis = game:GetService("UserInputService")
+					local rs = game:GetService("RunService")
+					local plr = p.LocalPlayer
+					local char = workspace:WaitForChild("Characters"):WaitForChild(plr.Name)
+					local proxy = workspace:WaitForChild("ProxyCharacter")
+					local keys = {}
+					local gVec = Vector3.new(0, 0, 0)
+					local mVec = Vector3.new(0, 0, 0)
+					local keyMap = {
+						[Enum.KeyCode.W] = Vector3.new(0, 0, 1),
+						[Enum.KeyCode.S] = Vector3.new(0, 0, -1),
+						[Enum.KeyCode.A] = Vector3.new(-1, 0, 0),
+						[Enum.KeyCode.D] = Vector3.new(1, 0, 0),
+					}
+					local inputBeganConn = uis.InputBegan:Connect(function(i, gp)
+						if gp then return end
+						if keyMap[i.KeyCode] then
+							keys[i.KeyCode] = true
+						end
+					end)
+					local inputEndedConn = uis.InputEnded:Connect(function(i)
+						if keyMap[i.KeyCode] then
+							keys[i.KeyCode] = nil
+						end
+					end)
+					local gamepadConn = uis.InputChanged:Connect(function(i)
+						if i.UserInputType == Enum.UserInputType.Gamepad1 or i.UserInputType == Enum.UserInputType.Gamepad2 then
+							if i.KeyCode == Enum.KeyCode.Thumbstick1 then
+								gVec = Vector3.new(i.Position.X, 0, i.Position.Y)
+							end
+						end
+					end)
+					local mobileConn = uis.InputChanged:Connect(function(i)
+						if i.UserInputType == Enum.UserInputType.Touch then
+							if i.UserInputState == Enum.UserInputState.Change then
+								mVec = Vector3.new(i.Position.X, 0, i.Position.Y)
+							end
+						end
+					end)
+					local function GetDir()
+						local m = Vector3.new(0, 0, 0)
+						for k, _ in pairs(keys) do
+							m = m + keyMap[k]
+						end
+						m = m + gVec + mVec
+						if m.Magnitude > 0 then
+							m = m.Unit
+							local cf = workspace.CurrentCamera.CFrame
+							local look = Vector3.new(cf.LookVector.X, 0, cf.LookVector.Z).Unit
+							local right = cf.RightVector
+							local d = right * m.X + look * m.Z
+							return d.Magnitude > 0 and d.Unit or Vector3.new(0, 0, 0)
+						end
+						return Vector3.new(0, 0, 0)
+					end
+					local renderConn = rs.RenderStepped:Connect(function(dt)
+						local act = char:GetAttribute("Action")
+						if act ~= "Gathering" then return end
+						local dir = GetDir()
+						if dir.Magnitude > 0 then
+							proxy.CFrame = proxy.CFrame + (dir * gatherSpd * dt)
+						end
+					end)
+					_G.GatherGlideConnections = {
+						inputBeganConn,
+						inputEndedConn,
+						gamepadConn,
+						mobileConn,
+						renderConn
+					}
+				else
+					if _G.GatherGlideConnections then
+						for _, conn in ipairs(_G.GatherGlideConnections) do
+							conn:Disconnect()
+						end
+						_G.GatherGlideConnections = nil
+					end
+				end
+			end
+		});
+
+		Tabs.Maintab:Slider({
+			Flag = "GatherGlideSpeedSlider",
+			Title = "Gather Glide Setting",
+			Step = 1,
+			Width = 200,
+			Value = {
+				Min = 1,
+				Max = 10,
+				Default = 7,
+			},
+			Callback = function(value)
+				gatherSpd = value
+			end
+		})
+
+		-- Experimental Section
+		Tabs.Maintab:Section({
+			Title = "Experimental"
+		});
+
+		local recoilDistance = 5
+		local TWEEN_TIME = 0.2
+		local GUARDER_CHECK_RATE = 10
+		local INV_TWEEN_TIME = 1 / TWEEN_TIME
+
+		Tabs.Maintab:Toggle({
+			Flag = "AntiContestToggle",
+			Title = "Anti Contest",
+			Default = false,
+			Callback = function(enabled)
+				if enabled then
+					local Players = game:GetService("Players")
+					local RunService = game:GetService("RunService")
+
+					local lp = Players.LocalPlayer
+					local charName = lp.Name
+					local charactersFolder = workspace:WaitForChild("Characters")
+					local character = charactersFolder:WaitForChild(charName)
+					local humanoidRootPart = workspace:WaitForChild("ProxyCharacter")
+					local obj = character
+
+					local actionActive = false
+					local wasShooting = false
+					local recoilActive = false
+					local recoilElapsed = 0
+					local recoilStartCF = nil
+					local recoilGuarderRoot = nil
+					local frameCount = 0
+					local cachedGuarder = nil
+
+					local function scanGuarder()
+						local closest = nil
+						local closestDist = math.huge
+						local hrpPos = humanoidRootPart.Position
+						local players = Players:GetPlayers()
+						for i = 1, #players do
+							local p = players[i]
+							if p == lp then continue end
+							local pChar = charactersFolder:FindFirstChild(p.Name)
+							if not pChar then continue end
+							if pChar:GetAttribute("HoldingG") ~= true then continue end
+							local pRoot = pChar:FindFirstChild("HumanoidRootPart")
+							if not pRoot then continue end
+							local dist = (hrpPos - pRoot.Position).Magnitude
+							if dist < closestDist then
+								closestDist = dist
+								closest = pRoot
+							end
+						end
+						cachedGuarder = closest
+					end
+
+					local function getGoalCFrame(guarderCF, startCF)
+						local look = guarderCF.LookVector
+						local flatX, flatZ = look.X, look.Z
+						if (flatX * flatX + flatZ * flatZ) < 1e-8 then
+							local right = guarderCF.RightVector
+							flatX, flatZ = right.X, right.Z
+							if (flatX * flatX + flatZ * flatZ) < 1e-8 then return startCF end
+						end
+						local dir = Vector3.new(flatX, 0, flatZ).Unit
+						local goalPos = startCF.Position + dir * recoilDistance
+						return CFrame.new(goalPos, goalPos + startCF.LookVector)
+					end
+
+					local attrConn = obj.AttributeChanged:Connect(function(attr)
+						if attr == "Action" then
+							actionActive = (obj:GetAttribute("Action") == "Shooting")
+						end
+					end)
+
+					local hbConn = RunService.Heartbeat:Connect(function(dt)
+						frameCount = frameCount + 1
+						if frameCount % GUARDER_CHECK_RATE == 0 then
+							scanGuarder()
+						end
+
+						if actionActive and not wasShooting then
+							local guarder = cachedGuarder
+							if guarder and guarder.Parent then
+								recoilStartCF = humanoidRootPart.CFrame
+								recoilGuarderRoot = guarder
+								recoilElapsed = 0
+								recoilActive = true
+							end
+						end
+
+						if recoilActive then
+							local gr = recoilGuarderRoot
+							if not gr or not gr.Parent then
+								recoilActive = false
+							else
+								recoilElapsed = recoilElapsed + dt
+								local t = recoilElapsed * INV_TWEEN_TIME
+								if t >= 1 then
+									t = 1
+									recoilActive = false
+								end
+								local inv = 1 - t
+								local et = 1 - inv * inv
+								local goalCF = getGoalCFrame(gr.CFrame, recoilStartCF)
+								humanoidRootPart.CFrame = recoilStartCF:Lerp(goalCF, et)
+							end
+						end
+
+						wasShooting = actionActive
+					end)
+
+					local ancestryConn = character.AncestryChanged:Connect(function()
+						if not character:IsDescendantOf(game) then
+							attrConn:Disconnect()
+							hbConn:Disconnect()
+							recoilActive = false
+							recoilGuarderRoot = nil
+							cachedGuarder = nil
+						end
+					end)
+
+					_G.AntiContestConnections = {
+						attrConn,
+						hbConn,
+						ancestryConn
+					}
+				else
+					if _G.AntiContestConnections then
+						for _, conn in ipairs(_G.AntiContestConnections) do
+							conn:Disconnect()
+						end
+						_G.AntiContestConnections = nil
+					end
+				end
+			end
+		});
+
+		Tabs.Maintab:Slider({
+			Flag = "AntiContestDistanceSlider",
+			Title = "Recoil Distance",
+			Step = 1,
+			Width = 200,
+			Value = {
+				Min = 1,
+				Max = 10,
+				Default = 5,
+			},
+			Callback = function(value)
+				recoilDistance = value
+			end
+		})
 	end
 
 
@@ -628,7 +887,7 @@ end
 			Width = 200,
 			Value = {
 				Min = 1,
-				Max = 20,
+				Max = 10,
 				Default = 7,
 			},
 			Callback = function(value)
@@ -937,9 +1196,9 @@ end
 	local charName = player.Name
 	local character = workspace.Characters:WaitForChild(charName)
 	
-	-- Walkspeed variables
+	-- Walkspeed variables (CFrame ProxyCharacter movement)
 	local walkspeedEnabled = false
-	local WALK_SPEED = 20
+	local WALK_SPEED = 7
 	
 	-- Stamina variables
 	local staminaEnabled = false
@@ -959,11 +1218,83 @@ end
 		Default = false,
 		Callback = function(enabled)
 			walkspeedEnabled = enabled
-			-- Set walkspeed once when enabled instead of continuous loop
 			if enabled then
-				pcall(function()
-					character:SetAttribute("WalkSpeed", WALK_SPEED)
+				local UserInputService = game:GetService("UserInputService")
+				local char = workspace:WaitForChild("Characters"):WaitForChild(player.Name)
+				local proxyCharacter = workspace:WaitForChild("ProxyCharacter")
+
+				local pressedKeys = {}
+				local gamepadVector = Vector3.new(0, 0, 0)
+				local mobileVector = Vector3.new(0, 0, 0)
+
+				local keyDirectionMap = {
+					[Enum.KeyCode.W] = Vector3.new(0, 0, 1),
+					[Enum.KeyCode.S] = Vector3.new(0, 0, -1),
+					[Enum.KeyCode.A] = Vector3.new(-1, 0, 0),
+					[Enum.KeyCode.D] = Vector3.new(1, 0, 0),
+				}
+
+				local inputBeganConn = UserInputService.InputBegan:Connect(function(input, gameProcessed)
+					if gameProcessed then return end
+					if keyDirectionMap[input.KeyCode] then
+						pressedKeys[input.KeyCode] = true
+					end
 				end)
+
+				local inputEndedConn = UserInputService.InputEnded:Connect(function(input)
+					if keyDirectionMap[input.KeyCode] then
+						pressedKeys[input.KeyCode] = nil
+					end
+				end)
+
+				local inputChangedConn = UserInputService.InputChanged:Connect(function(input)
+					if input.KeyCode == Enum.KeyCode.Thumbstick1 then
+						gamepadVector = Vector3.new(input.Position.X, 0, input.Position.Y)
+					elseif input.UserInputType == Enum.UserInputType.Touch and input.UserInputState == Enum.UserInputState.Change then
+						mobileVector = Vector3.new(input.Position.X, 0, input.Position.Y)
+					end
+				end)
+
+				local function GetTrueMoveDirection()
+					local move = Vector3.new(0, 0, 0)
+					for key in pairs(pressedKeys) do
+						move += keyDirectionMap[key]
+					end
+					move += gamepadVector + mobileVector
+					if move.Magnitude == 0 then
+						return Vector3.new(0, 0, 0)
+					end
+					move = move.Unit
+					local camCF = workspace.CurrentCamera.CFrame
+					local camLook = Vector3.new(camCF.LookVector.X, 0, camCF.LookVector.Z).Unit
+					local camRight = camCF.RightVector
+					local dir = camRight * move.X + camLook * move.Z
+					return dir.Magnitude > 0 and dir.Unit or Vector3.new(0, 0, 0)
+				end
+
+				local renderConn = RunService.RenderStepped:Connect(function(deltaTime)
+					if not walkspeedEnabled then return end
+					local action = char:GetAttribute("Action")
+					if action ~= nil and action ~= "" then return end
+					local trueDir = GetTrueMoveDirection()
+					if trueDir.Magnitude > 0 then
+						proxyCharacter.CFrame += trueDir * WALK_SPEED * deltaTime
+					end
+				end)
+
+				_G.WalkspeedConnections = {
+					inputBeganConn,
+					inputEndedConn,
+					inputChangedConn,
+					renderConn
+				}
+			else
+				if _G.WalkspeedConnections then
+					for _, conn in ipairs(_G.WalkspeedConnections) do
+						conn:Disconnect()
+					end
+					_G.WalkspeedConnections = nil
+				end
 			end
 		end
 	});
@@ -975,18 +1306,12 @@ end
 		Step = 1,
 		Width = 200,
 		Value = {
-			Min = 10,
-			Max = 20,
-			Default = 14,
+			Min = 1,
+			Max = 10,
+			Default = 7,
 		},
 		Callback = function(value)
 			WALK_SPEED = value
-			-- Set walkspeed immediately when slider changes (if enabled)
-			if walkspeedEnabled then
-				pcall(function()
-					character:SetAttribute("WalkSpeed", WALK_SPEED)
-				end)
-			end
 		end
 	});
 	
