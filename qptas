@@ -1796,8 +1796,8 @@ end
 					local char = workspace.Characters:WaitForChild(lp.Name)
 					-- Get ProxyCharacter
 					local proxyChar = workspace:WaitForChild("ProxyCharacter")
-					local LERP_SPEED = 0.015
-					local FRONT_OFFSET = 0.1
+					local LERP_SPEED = 0.0125
+					local FRONT_OFFSET = 0
 					local RANGE = 20 -- only activate within this many studs
 					-- lock Y position (using ProxyCharacter's initial Y position)
 					local LOCKED_Y = proxyChar.Position.Y
