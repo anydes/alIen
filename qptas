@@ -183,40 +183,25 @@ end
 		-- ══════════════════════════════════════════════════════════════════
 		-- CONFIGURATION
 		-- ══════════════════════════════════════════════════════════════════
-		-- Fully automatic release timing (no manual latency bias):
-		--   1) α-β filter estimates meter position/velocity (Kalman-lite)
-		--   2) Constant-accel prediction: y(t) = y + v t + ½ a t²
-		--   3) Fire when time-to-TARGET ≤ lead τ
-		--   4) τ = ping/2 + half-frame + residual
-		--      residual is Smith-style: learned from (minY - TARGET) / |v|
-		--      Sign: undershoot (minY too high) → τ too large → decrease τ
 	
 		local CONFIG = {
-			TARGET_Y = -1.4,                -- Ideal meter Y at server register
-			MIN_TARGET_Y = -1.6,
-			MAX_TARGET_Y = -1.0,
-	
-			-- α-β filter (constant-velocity Kalman gain pair)
-			AB_ALPHA = 0.45,                -- Position innovation weight
-			AB_BETA = 0.12,                 -- Velocity innovation weight
-			ACCEL_EMA = 0.30,               -- Accel smoother
-			MIN_SAMPLES = 4,
-			MAX_VELOCITY = 12,
-			MAX_ACCEL = 50,
-			OUTLIER_RATIO = 2.8,
-	
-			PERFECT_ZONE_Y = -1.4,
-			PERFECT_HOLD_TIME = 0.5,
-			MAX_SHOT_DURATION = 2.0,
-	
-			-- Lead-time learning (seconds)
-			PING_SCALE = 0.5,               -- RTT → one-way
-			RESIDUAL_MIN = -0.02,
-			RESIDUAL_MAX = 0.12,
-			TOLERANCE = 0.02,               -- |minY - TARGET| "perfect"
-			LEARN_FLOOR = 0.06,             -- Min learning rate after warmup
-	
-			AUTO_TIME_ENABLED = false,
+			FIRE_AT_Y = -1.35,              -- Y position to fire at
+			LATENCY_COMPENSATION = 0.025,   -- Combined latency bias (25ms)
+			VELOCITY_SAMPLES = 3,           -- Samples for velocity averaging
+			PERFECT_ZONE_Y = -1.4,          -- Perfect shot threshold
+			PERFECT_HOLD_TIME = 0.5,        -- Seconds to hold for perfect
+			MAX_SHOT_DURATION = 2.0,        -- Maximum shot duration in seconds
+			
+			-- Auto Improver Settings
+			AUTO_IMPROVE = true,            -- Toggle auto-improvement on/off
+			TARGET_Y = -1.4,                -- Ideal Y position we want to hit
+			IMPROVE_RATE = 0.025,           -- Learning rate (0-1): how much to trust each shot's calculation
+			IMPROVE_TOLERANCE = 0.05,       -- How close to target is "good enough"
+			MIN_FIRE_Y = -1.6,              -- Lowest FIRE_AT_Y can go
+			MAX_FIRE_Y = -1.0,              -- Highest FIRE_AT_Y can go
+			
+			-- Auto Time Settings
+			AUTO_TIME_ENABLED = false,      -- Toggle for auto time feature
 		}
 	
 		-- ══════════════════════════════════════════════════════════════════
@@ -224,103 +209,70 @@ end
 		-- ══════════════════════════════════════════════════════════════════
 	
 		local state = {
+			-- Flags
 			prepared = false,
 			started = false,
 			fired = false,
+			
+			-- Timing
 			startTime = nil,
-	
-			-- α-β / kinematics
-			filtY = nil,
-			velocity = nil,       -- signed dy/dt (negative while filling)
-			accel = nil,
-			sampleCount = 0,
-			lastMeasY = nil,
+			
+			-- Velocity tracking
+			velocitySamples = {},
+			velocity = nil,
+			
+			-- Meter tracking
+			lastY = nil,
 			lastTime = nil,
-			lastVelocity = nil,
-	
 			minY = 0,
-			fireSpeed = nil,      -- |v| at release (for learning)
-			firedAtY = nil,
-			leadUsed = nil,
-	
+			
+			-- Perfect shot
 			perfectEnterTime = nil,
 			isPerfect = false,
+			
 			shotCount = 0,
+			
+			-- Auto Improver tracking
+			firedAtY = nil,
 		}
 	
-		local timing = {
-			residual = 1 / 60,    -- Learned process/remote delay beyond ping/2
-			pingEma = 0,          -- Smoothed one-way ping
-			shots = 0,
-			perfect = 0,
-			errorEma = 0,
-			calibrated = false,
+		-- Auto Improver stats
+		local improverStats = {
+			totalShots = 0,
+			perfectShots = 0,
+			adjustments = 0,
 		}
 	
 		-- ══════════════════════════════════════════════════════════════════
-		-- LEAD TIME (fully automatic)
+		-- AUTO IMPROVER
 		-- ══════════════════════════════════════════════════════════════════
 	
-		local function sampleOneWayPing()
-			local ok, ping = pcall(function()
-				return player:GetNetworkPing()
-			end)
-			if ok and typeof(ping) == "number" and ping > 0 then
-				return math.clamp(ping, 0, 0.4) * CONFIG.PING_SCALE
-			end
-			return timing.pingEma > 0 and timing.pingEma or 0.025
-		end
-	
-		-- Lead = smoothed one-way ping + learned residual + half-frame
-		local function getLeadTimeNow(dt)
-			local oneWay = sampleOneWayPing()
-			if timing.pingEma <= 0 then
-				timing.pingEma = oneWay
-			else
-				timing.pingEma = timing.pingEma * 0.9 + oneWay * 0.1
-			end
-			local halfFrame = 0.5 * math.clamp(dt or 1 / 60, 1 / 240, 1 / 20)
-			return timing.pingEma + timing.residual + halfFrame
-		end
-	
-		-- Smith-style residual update from observed meter error
-		-- y_server ≈ TARGET + v*(L - τ)  ⇒  err = minY - TARGET ≈ v*(L - τ)
-		-- With v < 0: err > 0 (undershoot) ⇒ τ > L ⇒ decrease residual
-		local function calibrateFromShot()
-			if not state.fired or not state.fireSpeed then
+		local function autoImprove()
+			if not CONFIG.AUTO_IMPROVE or not state.fired or not state.firedAtY then
 				return
 			end
-	
-			timing.shots = timing.shots + 1
-			local err = state.minY - CONFIG.TARGET_Y
-			timing.errorEma = timing.errorEma * 0.65 + err * 0.35
-	
-			local speed = state.fireSpeed
-			if speed < 1e-4 then
+			
+			improverStats.totalShots = improverStats.totalShots + 1
+			
+			local error = state.minY - CONFIG.TARGET_Y
+			local shotVelocity = state.velocity or 0
+			
+			if math.abs(error) <= CONFIG.IMPROVE_TOLERANCE then
+				improverStats.perfectShots = improverStats.perfectShots + 1
 				return
 			end
-	
-			if math.abs(err) <= CONFIG.TOLERANCE then
-				timing.perfect = timing.perfect + 1
-				timing.calibrated = true
+			
+			if shotVelocity <= 0 then
 				return
 			end
-	
-			-- Position error → time error (seconds). Correct sign: subtract.
-			-- undershoot (err > 0) ⇒ fired too early ⇒ τ too large ⇒ decrease residual
-			local timeErr = err / speed
-			-- Fast early learning (≈ 1/n), then floor so it still tracks ping changes
-			local alpha = math.max(CONFIG.LEARN_FLOOR, 1 / (timing.shots + 1))
-			if timing.shots <= 3 then
-				alpha = math.min(0.85, alpha * 1.8)
-			end
-	
-			timing.residual = math.clamp(
-				timing.residual - alpha * timeErr,
-				CONFIG.RESIDUAL_MIN,
-				CONFIG.RESIDUAL_MAX
-			)
-			timing.calibrated = timing.shots >= 2
+			
+			local idealFireY = state.firedAtY + error
+			local adjustment = (idealFireY - CONFIG.FIRE_AT_Y) * CONFIG.IMPROVE_RATE
+			
+			CONFIG.FIRE_AT_Y = CONFIG.FIRE_AT_Y + adjustment
+			CONFIG.FIRE_AT_Y = math.max(CONFIG.MIN_FIRE_Y, math.min(CONFIG.MAX_FIRE_Y, CONFIG.FIRE_AT_Y))
+			
+			improverStats.adjustments = improverStats.adjustments + 1
 		end
 	
 		local function reset()
@@ -328,167 +280,66 @@ end
 			state.started = false
 			state.fired = false
 			state.startTime = nil
-			state.filtY = nil
+			state.velocitySamples = {}
 			state.velocity = nil
-			state.accel = nil
-			state.sampleCount = 0
-			state.lastMeasY = nil
+			state.lastY = nil
 			state.lastTime = nil
-			state.lastVelocity = nil
 			state.minY = 0
-			state.fireSpeed = nil
-			state.firedAtY = nil
-			state.leadUsed = nil
 			state.perfectEnterTime = nil
 			state.isPerfect = false
+			state.firedAtY = nil
 		end
 	
 		-- ══════════════════════════════════════════════════════════════════
-		-- α-β FILTER + ACCEL + TIME-TO-TARGET
+		-- VELOCITY & PREDICTION
 		-- ══════════════════════════════════════════════════════════════════
 	
-		local function updateFilter(measY, now)
-			if not state.lastTime then
-				state.filtY = measY
-				state.lastMeasY = measY
-				state.lastTime = now
-				state.velocity = 0
-				return
+		local function updateVelocity(deltaY, deltaTime)
+			if deltaY <= 0 or deltaTime <= 0 then return end
+			
+			local v = deltaY / deltaTime
+			local samples = state.velocitySamples
+			
+			table.insert(samples, v)
+			if #samples > CONFIG.VELOCITY_SAMPLES then
+				table.remove(samples, 1)
 			end
-	
-			local dt = now - state.lastTime
-			if dt < 1e-4 then
-				return
+			
+			local sum = 0
+			for i = 1, #samples do
+				sum = sum + samples[i]
 			end
-	
-			local dy = measY - (state.lastMeasY or measY)
-			if math.abs(dy) < 1e-5 and state.sampleCount > 0 then
-				-- Still advance time so filter doesn't freeze on flat frames
-				local yPred = state.filtY + (state.velocity or 0) * dt
-				state.filtY = yPred
-				state.lastTime = now
-				return
-			end
-	
-			local rawV = dy / dt
-			if math.abs(rawV) > CONFIG.MAX_VELOCITY then
-				state.lastMeasY = measY
-				state.lastTime = now
-				return
-			end
-	
-			if state.velocity and state.sampleCount >= CONFIG.MIN_SAMPLES then
-				local expected = math.abs(state.velocity)
-				if expected > 1e-3 and math.abs(rawV) > expected * CONFIG.OUTLIER_RATIO then
-					state.lastMeasY = measY
-					state.lastTime = now
-					return
-				end
-			end
-	
-			-- α-β predict + update
-			local v = state.velocity or rawV
-			local yPred = (state.filtY or measY) + v * dt
-			local resid = measY - yPred
-			local yNew = yPred + CONFIG.AB_ALPHA * resid
-			local vNew = v + (CONFIG.AB_BETA / dt) * resid
-			vNew = math.clamp(vNew, -CONFIG.MAX_VELOCITY, CONFIG.MAX_VELOCITY)
-	
-			if state.lastVelocity then
-				local rawA = (vNew - state.lastVelocity) / dt
-				rawA = math.clamp(rawA, -CONFIG.MAX_ACCEL, CONFIG.MAX_ACCEL)
-				if not state.accel then
-					state.accel = rawA
-				else
-					local aa = CONFIG.ACCEL_EMA
-					state.accel = state.accel * (1 - aa) + rawA * aa
-				end
-			end
-	
-			state.filtY = yNew
-			state.velocity = vNew
-			state.lastVelocity = vNew
-			state.lastMeasY = measY
-			state.lastTime = now
-			state.sampleCount = state.sampleCount + 1
+			state.velocity = sum / #samples
 		end
 	
-		-- Solve ½ a t² + v t + (y - target) = 0 for smallest t ≥ 0
-		local function timeToReach(y, target, v, a)
-			local dy = target - y
-			if y <= target then
-				return 0
-			end
-			if not v then
-				return nil
-			end
-	
-			if not a or math.abs(a) < 1e-5 then
-				if math.abs(v) < 1e-8 then
-					return nil
-				end
-				local t = dy / v
-				return t >= 0 and t or nil
-			end
-	
-			local A = 0.5 * a
-			local B = v
-			local C = -dy
-			local disc = B * B - 4 * A * C
-			if disc < 0 then
-				if math.abs(v) < 1e-8 then
-					return nil
-				end
-				local t = dy / v
-				return t >= 0 and t or nil
-			end
-	
-			local sqrtD = math.sqrt(disc)
-			local inv = 1 / (2 * A)
-			local t1 = (-B - sqrtD) * inv
-			local t2 = (-B + sqrtD) * inv
-			local best = nil
-			if t1 >= 0 then best = t1 end
-			if t2 >= 0 and (not best or t2 < best) then best = t2 end
-			return best
-		end
-	
-		local function shouldFire(dt)
+		local function shouldFire(currentY, currentTime)
 			if not CONFIG.AUTO_TIME_ENABLED then
 				return false
 			end
-			if state.sampleCount < CONFIG.MIN_SAMPLES or not state.velocity or not state.filtY then
+			
+			if not state.velocity or state.velocity <= 0 then
 				return false
 			end
-			if state.velocity >= -1e-4 then
-				return false
-			end
-	
-			local y = state.filtY
-			local target = CONFIG.TARGET_Y
-			if y <= target then
+			
+			if currentY <= CONFIG.FIRE_AT_Y then
 				return true
 			end
-	
-			local t = timeToReach(y, target, state.velocity, state.accel)
-			if not t then
-				return false
-			end
-	
-			local lead = getLeadTimeNow(dt)
-			state.leadUsed = lead
-			return t <= lead
+			
+			local distance = math.abs(CONFIG.FIRE_AT_Y - currentY)
+			local timeToTarget = distance / state.velocity
+			
+			return timeToTarget <= CONFIG.LATENCY_COMPENSATION
 		end
 	
 		-- ══════════════════════════════════════════════════════════════════
 		-- ACTIONS
 		-- ══════════════════════════════════════════════════════════════════
 	
-		local function fire()
+		local function fire(currentY)
 			if state.fired then return end
 			state.fired = true
-			state.firedAtY = state.filtY or state.lastMeasY
-			state.fireSpeed = state.velocity and math.abs(state.velocity) or nil
+			state.firedAtY = currentY
+			
 			fireShoot()
 		end
 	
@@ -497,7 +348,8 @@ end
 				if not state.perfectEnterTime then
 					state.perfectEnterTime = now
 				elseif not state.isPerfect then
-					if (now - state.perfectEnterTime) >= CONFIG.PERFECT_HOLD_TIME then
+					local held = now - state.perfectEnterTime
+					if held >= CONFIG.PERFECT_HOLD_TIME then
 						state.isPerfect = true
 					end
 				end
@@ -510,18 +362,10 @@ end
 		-- MAIN LOOP
 		-- ══════════════════════════════════════════════════════════════════
 	
-		local lastClock = os.clock()
-	
-		RunService.Heartbeat:Connect(function(dt)
+		RunService.Heartbeat:Connect(function()
 			local now = os.clock()
-			local frameDt = dt
-			if typeof(frameDt) ~= "number" or frameDt <= 0 then
-				frameDt = math.clamp(now - lastClock, 1 / 240, 1 / 20)
-			end
-			lastClock = now
-	
 			local enabled = verticalMeter.Enabled
-	
+			
 			if enabled then
 				if not state.prepared then
 					state.prepared = true
@@ -529,48 +373,53 @@ end
 				end
 			else
 				if state.prepared then
-					if state.started and state.fired then
-						calibrateFromShot()
+					if state.started then
+						autoImprove()
 					end
 					reset()
 				end
 				return
 			end
-	
+			
 			local currentY = fillGradient.Offset.Y
-	
+			
 			if state.prepared and not state.started and currentY < 0 then
 				state.started = true
 				state.startTime = now
-				state.filtY = currentY
-				state.lastMeasY = currentY
+				state.lastY = currentY
 				state.lastTime = now
-				state.velocity = 0
 				state.minY = currentY
 			end
-	
+			
 			if state.started then
-				if (now - state.startTime) >= CONFIG.MAX_SHOT_DURATION then
-					if state.fired then
-						calibrateFromShot()
-					end
+				local duration = now - state.startTime
+				if duration >= CONFIG.MAX_SHOT_DURATION then
+					autoImprove()
 					reset()
 					return
 				end
 			end
-	
-			if state.started then
+			
+			if state.started and not state.fired then
 				if currentY < state.minY then
 					state.minY = currentY
 				end
-	
-				if not state.fired then
-					updateFilter(currentY, now)
-					if shouldFire(frameDt) then
-						fire()
-					end
-					checkPerfectZone(currentY, now)
+				
+				if currentY ~= state.lastY and state.lastTime then
+					local deltaY = math.abs(currentY - state.lastY)
+					local deltaTime = now - state.lastTime
+					
+					updateVelocity(deltaY, deltaTime)
+					
+					state.lastY = currentY
+					state.lastTime = now
 				end
+				
+				if shouldFire(currentY, now) then
+					fire(currentY)
+				end
+				
+				checkPerfectZone(currentY, now)
 			end
 		end)
 	
@@ -583,36 +432,30 @@ end
 			Default = false,
 			Callback = function(value)
 				CONFIG.AUTO_TIME_ENABLED = value
-				-- Soft reset residual seed from current ping when enabling
-				if value then
-					timing.pingEma = sampleOneWayPing()
-					if timing.shots == 0 then
-						timing.residual = 1 / 60
-					end
-				end
 			end
 		});
 		
 		Tabs.Maintab:Slider({
-			Title = "Target",
+			Title = "Offset",
 			Step = 0.01,
 			Width = 200,
 			Value = {
-				Min = -1.55,
-				Max = -1.2,
-				Default = -1.4,
+				Min = -1.4,
+				Max = -1,
+				Default = -1.35,
 			},
 			Callback = function(value)
-				CONFIG.TARGET_Y = math.clamp(value, CONFIG.MIN_TARGET_Y, CONFIG.MAX_TARGET_Y)
-				CONFIG.PERFECT_ZONE_Y = CONFIG.TARGET_Y
+				CONFIG.FIRE_AT_Y = value
 			end
 		});
 
+
                 local Paragraph = Tabs.Maintab:Paragraph({
         Title = "Steps",
-        Desc = "Use Default Shot Meter.\nTarget = perfect meter height.\nLatency self-calibrates from each shot — no bias slider.",
+        Desc = "Use Defualt Shot Meter\n\nFind your own timings.",
         Locked = false,
         })
+
 		-- Glide Section
 		Tabs.Maintab:Section({
 			Title = "Glide"
@@ -871,7 +714,6 @@ end
 		local TWEEN_TIME = 0.2
 		local GUARDER_CHECK_RATE = 10
 		local INV_TWEEN_TIME = 1 / TWEEN_TIME
-		local GUARD_RADIUS = 10 -- only closest HoldingG player within this range
 
 		Tabs.Maintab:Toggle({
 			Flag = "AntiContestToggle",
@@ -898,10 +740,9 @@ end
 					local frameCount = 0
 					local cachedGuarder = nil
 
-					-- Closest player within GUARD_RADIUS who has HoldingG == true
 					local function scanGuarder()
 						local closest = nil
-						local closestDist = GUARD_RADIUS
+						local closestDist = math.huge
 						local hrpPos = humanoidRootPart.Position
 						local players = Players:GetPlayers()
 						for i = 1, #players do
@@ -913,20 +754,12 @@ end
 							local pRoot = pChar:FindFirstChild("HumanoidRootPart")
 							if not pRoot then continue end
 							local dist = (hrpPos - pRoot.Position).Magnitude
-							if dist <= closestDist then
+							if dist < closestDist then
 								closestDist = dist
 								closest = pRoot
 							end
 						end
 						cachedGuarder = closest
-					end
-
-					local function guarderStillValid(guarder)
-						if not guarder or not guarder.Parent then return false end
-						local pChar = guarder.Parent
-						if pChar:GetAttribute("HoldingG") ~= true then return false end
-						local dist = (humanoidRootPart.Position - guarder.Position).Magnitude
-						return dist <= GUARD_RADIUS
 					end
 
 					local function getGoalCFrame(guarderCF, startCF)
@@ -956,7 +789,7 @@ end
 
 						if actionActive and not wasShooting then
 							local guarder = cachedGuarder
-							if guarderStillValid(guarder) then
+							if guarder and guarder.Parent then
 								recoilStartCF = humanoidRootPart.CFrame
 								recoilGuarderRoot = guarder
 								recoilElapsed = 0
@@ -966,9 +799,8 @@ end
 
 						if recoilActive then
 							local gr = recoilGuarderRoot
-							if not guarderStillValid(gr) then
+							if not gr or not gr.Parent then
 								recoilActive = false
-								recoilGuarderRoot = nil
 							else
 								recoilElapsed = recoilElapsed + dt
 								local t = recoilElapsed * INV_TWEEN_TIME
@@ -1951,410 +1783,83 @@ end
 			Title = "Experimental"
 		});
 		
-		local autoContestMode = "v1"
-		local autoContestActive = false
-		local AUTO_CONTEST_BIND_NAME = "VantaAutoContestDominant"
-		local AUTO_CONTEST_FREEZE_ACTION = "VantaContestFreezeMove"
-		local v1Contesting = false
-		local v1ControlsDisabled = false
-		local v1OldMoveFunction = nil
-		local v1Controls = nil
-
-		local function forceUnlockV1Controls()
-			local ContextActionService = game:GetService("ContextActionService")
-			local RunService = game:GetService("RunService")
-			local Players = game:GetService("Players")
-
-			pcall(function()
-				RunService:UnbindFromRenderStep(AUTO_CONTEST_BIND_NAME)
-			end)
-			pcall(function()
-				ContextActionService:UnbindAction(AUTO_CONTEST_FREEZE_ACTION)
-			end)
-
-			if v1ControlsDisabled or v1Contesting or v1OldMoveFunction then
-				local lp = Players.LocalPlayer
-				local c = v1Controls
-				if not c then
-					pcall(function()
-						local ps = lp:FindFirstChild("PlayerScripts")
-						if not ps then return end
-						local pm = ps:FindFirstChild("PlayerModule")
-						if not pm then return end
-						local mod = require(pm)
-						if typeof(mod.GetControls) == "function" then
-							c = mod:GetControls()
-						else
-							c = mod.controls
-						end
-					end)
-				end
-				if c then
-					pcall(function()
-						if v1OldMoveFunction then
-							c.moveFunction = v1OldMoveFunction
-						elseif typeof(lp.Move) == "function" then
-							c.moveFunction = lp.Move
-						end
-						if typeof(c.Enable) == "function" then
-							c:Enable()
-						end
-					end)
-				end
-			end
-
-			v1Contesting = false
-			v1ControlsDisabled = false
-			v1OldMoveFunction = nil
-			v1Controls = nil
-		end
-
-		local function stopAutoContest()
-			forceUnlockV1Controls()
-			if _G.autoContestConnection then
-				_G.autoContestConnection:Disconnect()
-				_G.autoContestConnection = nil
-			end
-			_G.autoContestCleanup = nil
-		end
-
-		local function startAutoContestV1()
-					local Players = game:GetService("Players")
-					local RunService = game:GetService("RunService")
-					local ContextActionService = game:GetService("ContextActionService")
-					local lp = Players.LocalPlayer
-					local characters = workspace:WaitForChild("Characters")
-					local char = characters:WaitForChild(lp.Name)
-					local proxyChar = workspace:WaitForChild("ProxyCharacter")
-
-					-- Smooth closeout (legit look) — not a snap/teleport
-					local MOVE_SPEED = 6
-					local TURN_RATE = 12 -- rad-ish blend for facing
-					local POS_SMOOTH = 14 -- exp approach rate
-					local CONTEST_OFFSET = 0.1 -- regular auto contest stand-in-front
-					local GLUE_OFFSET = 6 -- one-time TP/glue stand-in-front
-					local RANGE = 15
-					local MAX_Y_DELTA = 8
-					local ARRIVE_EPS = 0.4
-					local FACE_GLUE_DIST = 4 -- trigger one-time glue when this close
-					local didFaceGlue = false -- one-shot glue per contest engagement
-
-					local function isHoldingG()
-						return char:GetAttribute("HoldingG") == true
-					end
-
-					-- Grab default ControlModule if present (keyboard + gamepad + touch)
-					local function getControls()
-						if v1Controls then return v1Controls end
-						local ok, result = pcall(function()
-							local ps = lp:FindFirstChild("PlayerScripts")
-							if not ps then return nil end
-							local pm = ps:FindFirstChild("PlayerModule")
-							if not pm then return nil end
-							local mod = require(pm)
-							if typeof(mod.GetControls) == "function" then
-								return mod:GetControls()
-							end
-							return mod.controls
-						end)
-						if ok then
-							v1Controls = result
-						end
-						return v1Controls
-					end
-
-					-- Sink ALL PlayerActions (WASD, arrows, gamepad sticks/buttons, thumbstick move)
-					local function sinkMovement(active)
-						pcall(function()
-							ContextActionService:UnbindAction(AUTO_CONTEST_FREEZE_ACTION)
-						end)
-						if not active then return end
-						local actions = Enum.PlayerActions:GetEnumItems()
-						ContextActionService:BindActionAtPriority(
-							AUTO_CONTEST_FREEZE_ACTION,
-							function()
-								return Enum.ContextActionResult.Sink
-							end,
-							false,
-							Enum.ContextActionPriority.High.Value + 1000,
-							table.unpack(actions)
-						)
-					end
-
-					-- Null player:Move so ControlModule can't apply any device input
-					local function lockControls(active)
-						local c = getControls()
-						if active then
-							if v1ControlsDisabled then return end
-							if c then
-								v1OldMoveFunction = c.moveFunction
-								c.moveFunction = function() end
-								pcall(function()
-									if typeof(c.Disable) == "function" then
-										c:Disable()
-									end
-								end)
-							end
-							sinkMovement(true)
-							v1ControlsDisabled = true
-						else
-							sinkMovement(false)
-							if v1ControlsDisabled and c then
-								pcall(function()
-									if v1OldMoveFunction then
-										c.moveFunction = v1OldMoveFunction
-									elseif typeof(lp.Move) == "function" then
-										c.moveFunction = lp.Move
-									end
-									if typeof(c.Enable) == "function" then
-										c:Enable()
-									end
-								end)
-							end
-							v1ControlsDisabled = false
-							v1OldMoveFunction = nil
-						end
-					end
-
-					local function beginContestLock()
-						if v1Contesting then return end
-						v1Contesting = true
-						didFaceGlue = false
-						lockControls(true)
-					end
-
-					local function endContestLock()
-						if not v1Contesting and not v1ControlsDisabled then return end
-						v1Contesting = false
-						didFaceGlue = false
-						lockControls(false)
-					end
-
-					local function getContestTarget()
-						local bestRoot, bestDist = nil, RANGE
-						local myPos = proxyChar.Position
-						for _, p in ipairs(Players:GetPlayers()) do
-							if p == lp then continue end
-							local model = characters:FindFirstChild(p.Name)
-							if not model then continue end
-							local action = model:GetAttribute("Action")
-							if action ~= "Shooting" and action ~= "Dunking" then continue end
-							local root = model:FindFirstChild("HumanoidRootPart")
-							if not root then continue end
-							if math.abs(root.Position.Y - myPos.Y) > MAX_Y_DELTA then continue end
-							local d = (Vector3.new(root.Position.X, myPos.Y, root.Position.Z) - myPos).Magnitude
-							if d < bestDist then
-								bestDist = d
-								bestRoot = root
-							end
-						end
-						return bestRoot, bestDist
-					end
-
-					-- In front of shooter facing; keep our Y. offset = GLUE_OFFSET or CONTEST_OFFSET
-					local function contestGoalPos(targetRoot, myY, offset)
-						local look = targetRoot.CFrame.LookVector
-						local flat = Vector3.new(look.X, 0, look.Z)
-						if flat.Magnitude < 1e-4 then
-							local right = targetRoot.CFrame.RightVector
-							flat = Vector3.new(right.X, 0, right.Z)
-						end
-						if flat.Magnitude < 1e-4 then
-							return nil
-						end
-						flat = flat.Unit
-						local vel = Vector3.zero
-						pcall(function()
-							vel = targetRoot.AssemblyLinearVelocity
-						end)
-						local lead = Vector3.new(vel.X, 0, vel.Z) * 0.08
-						local targetXZ = Vector3.new(targetRoot.Position.X, myY, targetRoot.Position.Z) + lead
-						return targetXZ + flat * offset
-					end
-
-					local function smoothFace(fromCF, lookAt, dt)
-						local pos = fromCF.Position
-						local flatLook = Vector3.new(lookAt.X - pos.X, 0, lookAt.Z - pos.Z)
-						if flatLook.Magnitude < 0.05 then
-							return fromCF
-						end
-						local goal = CFrame.new(pos, pos + flatLook.Unit)
-						local alpha = 1 - math.exp(-TURN_RATE * dt)
-						return fromCF:Lerp(goal, alpha)
-					end
-
-					local function hardFace(pos, lookAt)
-						local flatLook = Vector3.new(lookAt.X - pos.X, 0, lookAt.Z - pos.Z)
-						if flatLook.Magnitude < 0.05 then
-							return CFrame.new(pos)
-						end
-						return CFrame.new(pos, pos + flatLook.Unit)
-					end
-
-					local function applyContest(dt)
-						dt = math.clamp(dt or 1 / 60, 0, 0.05)
-
-						if not proxyChar or not proxyChar.Parent or not char or not char.Parent then
-							endContestLock()
-							return
-						end
-						if not isHoldingG() then
-							endContestLock()
-							return
-						end
-
-						local targetRoot = getContestTarget()
-						if not targetRoot or not targetRoot.Parent then
-							endContestLock()
-							return
-						end
-
-						beginContestLock()
-
-						local myPos = proxyChar.Position
-						local myY = myPos.Y
-						local lookAt = Vector3.new(targetRoot.Position.X, myY, targetRoot.Position.Z)
-						local distToShooter = (lookAt - Vector3.new(myPos.X, myY, myPos.Z)).Magnitude
-
-						-- One-time perfect glue at GLUE_OFFSET (4), then normal contest takes over
-						if not didFaceGlue and distToShooter <= FACE_GLUE_DIST then
-							local gluePos = contestGoalPos(targetRoot, myY, GLUE_OFFSET)
-							if gluePos then
-								proxyChar.CFrame = hardFace(Vector3.new(gluePos.X, myY, gluePos.Z), lookAt)
-								didFaceGlue = true
-								return
-							end
-						end
-
-						local goalPos = contestGoalPos(targetRoot, myY, CONTEST_OFFSET)
-						if not goalPos then return end
-
-						local toGoal = Vector3.new(goalPos.X - myPos.X, 0, goalPos.Z - myPos.Z)
-						local dist = toGoal.Magnitude
-
-						local nextPos
-						if dist > ARRIVE_EPS and toGoal.Magnitude > 1e-4 then
-							local dir = toGoal.Unit
-							local step = math.min(dist, MOVE_SPEED * dt)
-							local stepped = myPos + dir * step
-							local alpha = 1 - math.exp(-POS_SMOOTH * dt)
-							local blended = stepped:Lerp(Vector3.new(goalPos.X, myY, goalPos.Z), alpha * 0.15)
-							nextPos = Vector3.new(blended.X, myY, blended.Z)
-						else
-							local alpha = 1 - math.exp(-POS_SMOOTH * dt)
-							local settled = myPos:Lerp(Vector3.new(goalPos.X, myY, goalPos.Z), alpha)
-							nextPos = Vector3.new(settled.X, myY, settled.Z)
-						end
-
-						local base = CFrame.new(nextPos) * (proxyChar.CFrame - proxyChar.CFrame.Position)
-						local faced = smoothFace(base, lookAt, dt)
-						proxyChar.CFrame = faced
-					end
-
-					pcall(function()
-						RunService:UnbindFromRenderStep(AUTO_CONTEST_BIND_NAME)
-					end)
-					RunService:BindToRenderStep(AUTO_CONTEST_BIND_NAME, Enum.RenderPriority.Last.Value + 100, applyContest)
-		end
-
-		local function startAutoContestV2()
-			local Players = game:GetService("Players")
-			local RunService = game:GetService("RunService")
-			local lp = Players.LocalPlayer
-			local char = workspace.Characters:WaitForChild(lp.Name)
-			local proxyChar = workspace:WaitForChild("ProxyCharacter")
-			local LERP_SPEED = 0.014
-			local FRONT_OFFSET = 0.1
-			local RANGE = 20
-			local LOCKED_Y = proxyChar.Position.Y
-
-			local function isHoldingG()
-				return char:GetAttribute("HoldingG") == true
-			end
-
-			local function getClosestPlayer()
-				local closest
-				local dist = math.huge
-				for _, p in ipairs(Players:GetPlayers()) do
-					if p ~= lp then
-						local charModel = workspace.Characters:FindFirstChild(p.Name)
-						if charModel and charModel:FindFirstChild("HumanoidRootPart") then
-							local root = charModel.HumanoidRootPart
-							local d = (proxyChar.Position - root.Position).Magnitude
-							if d < dist then
-								dist = d
-								closest = p
-							end
-						end
-					end
-				end
-				return closest, dist
-			end
-
-			local function isActionShootingOrDunking(player)
-				local charModel = workspace.Characters:FindFirstChild(player.Name)
-				if not charModel then return false end
-				local action = charModel:GetAttribute("Action")
-				return action == "Shooting" or action == "Dunking"
-			end
-
-			_G.autoContestConnection = RunService.Heartbeat:Connect(function()
-				if not isHoldingG() then return end
-				local targetPlayer, dist = getClosestPlayer()
-				if not targetPlayer then return end
-				if dist > RANGE then return end
-				if not isActionShootingOrDunking(targetPlayer) then return end
-				local targetRoot = workspace.Characters[targetPlayer.Name].HumanoidRootPart
-				local facePos = targetRoot.Position + (targetRoot.CFrame.LookVector * FRONT_OFFSET)
-				facePos = Vector3.new(facePos.X, LOCKED_Y, facePos.Z)
-				local goal = CFrame.new(
-					facePos,
-					Vector3.new(targetRoot.Position.X, LOCKED_Y, targetRoot.Position.Z)
-				)
-				proxyChar.CFrame = proxyChar.CFrame:Lerp(goal, LERP_SPEED)
-			end)
-		end
-
-		local function startAutoContest()
-			stopAutoContest()
-			if autoContestMode == "v2" then
-				startAutoContestV2()
-			else
-				startAutoContestV1()
-			end
-		end
-
 		-- FIXED: Added Flag
 		Tabs.DefenseTab:Toggle({
 			Flag = "AutoContestToggle",
 			Title = "Auto Contest",
 			Default = false,
 			Callback = function(enabled)
-				autoContestActive = enabled
 				if enabled then
-					startAutoContest()
+					local Players = game:GetService("Players")
+					local RunService = game:GetService("RunService")
+					local lp = Players.LocalPlayer
+					local char = workspace.Characters:WaitForChild(lp.Name)
+					-- Get ProxyCharacter
+					local proxyChar = workspace:WaitForChild("ProxyCharacter")
+					local LERP_SPEED = 0.0135
+					local FRONT_OFFSET = 0.1
+					local RANGE = 20 -- only activate within this many studs
+					-- lock Y position (using ProxyCharacter's initial Y position)
+					local LOCKED_Y = proxyChar.Position.Y
+					local function isHoldingG()
+						return char:GetAttribute("HoldingG") == true
+					end
+					local function getClosestPlayer()
+						local closest
+						local dist = math.huge
+						for _, p in ipairs(Players:GetPlayers()) do
+							if p ~= lp then
+								local charModel = workspace.Characters:FindFirstChild(p.Name)
+								if charModel and charModel:FindFirstChild("HumanoidRootPart") then
+									local root = charModel.HumanoidRootPart
+									local d = (proxyChar.Position - root.Position).Magnitude
+									if d < dist then
+										dist = d
+										closest = p
+									end
+								end
+							end
+						end
+						return closest, dist
+					end
+					local function isActionShootingOrDunking(player)
+						local charModel = workspace.Characters:FindFirstChild(player.Name)
+						if not charModel then return false end
+						local action = charModel:GetAttribute("Action")
+						if action == "Shooting" or action == "Dunking" then
+							return true
+						end
+						return false
+					end
+					_G.autoContestConnection = RunService.Heartbeat:Connect(function()
+						if not isHoldingG() then return end
+						local targetPlayer, dist = getClosestPlayer()
+						if not targetPlayer then return end
+						if dist > RANGE then return end
+						if not isActionShootingOrDunking(targetPlayer) then return end
+						local targetRoot = workspace.Characters[targetPlayer.Name].HumanoidRootPart
+						local facePos = targetRoot.Position + (targetRoot.CFrame.LookVector * FRONT_OFFSET)
+						-- lock Y position
+						facePos = Vector3.new(facePos.X, LOCKED_Y, facePos.Z)
+						local goal = CFrame.new(
+							facePos,
+							Vector3.new(targetRoot.Position.X, LOCKED_Y, targetRoot.Position.Z)
+						)
+						proxyChar.CFrame = proxyChar.CFrame:Lerp(goal, LERP_SPEED)
+					end)
 				else
-					stopAutoContest()
+					if _G.autoContestConnection then
+						_G.autoContestConnection:Disconnect()
+						_G.autoContestConnection = nil
+					end
 				end
 			end
 		})
 
-		Tabs.DefenseTab:Dropdown({
-			Flag = "AutoContestMode",
-			Title = "Mode",
-			Values = {"v1", "v2"},
-			Value = "v1",
-			Callback = function(mode)
-				autoContestMode = mode
-				if autoContestActive then
-					startAutoContest()
-				end
-			end
-		})
 
                 local Paragraph = Tabs.DefenseTab:Paragraph({
         Title = "Disclamer",
-        Desc = "hold hands out",
+        Desc = "Only works with your hands out. Dont Jump.",
         Locked = false,
         })     
 
