@@ -1953,15 +1953,69 @@ end
 		
 		local autoContestMode = "v1"
 		local autoContestActive = false
+		local AUTO_CONTEST_BIND_NAME = "VantaAutoContestDominant"
+		local AUTO_CONTEST_FREEZE_ACTION = "VantaContestFreezeMove"
+		local v1Contesting = false
+		local v1ControlsDisabled = false
+		local v1OldMoveFunction = nil
+		local v1Controls = nil
+
+		local function forceUnlockV1Controls()
+			local ContextActionService = game:GetService("ContextActionService")
+			local RunService = game:GetService("RunService")
+			local Players = game:GetService("Players")
+
+			pcall(function()
+				RunService:UnbindFromRenderStep(AUTO_CONTEST_BIND_NAME)
+			end)
+			pcall(function()
+				ContextActionService:UnbindAction(AUTO_CONTEST_FREEZE_ACTION)
+			end)
+
+			if v1ControlsDisabled or v1Contesting or v1OldMoveFunction then
+				local lp = Players.LocalPlayer
+				local c = v1Controls
+				if not c then
+					pcall(function()
+						local ps = lp:FindFirstChild("PlayerScripts")
+						if not ps then return end
+						local pm = ps:FindFirstChild("PlayerModule")
+						if not pm then return end
+						local mod = require(pm)
+						if typeof(mod.GetControls) == "function" then
+							c = mod:GetControls()
+						else
+							c = mod.controls
+						end
+					end)
+				end
+				if c then
+					pcall(function()
+						if v1OldMoveFunction then
+							c.moveFunction = v1OldMoveFunction
+						elseif typeof(lp.Move) == "function" then
+							c.moveFunction = lp.Move
+						end
+						if typeof(c.Enable) == "function" then
+							c:Enable()
+						end
+					end)
+				end
+			end
+
+			v1Contesting = false
+			v1ControlsDisabled = false
+			v1OldMoveFunction = nil
+			v1Controls = nil
+		end
 
 		local function stopAutoContest()
-			if _G.autoContestCleanup then
-				_G.autoContestCleanup()
-			end
+			forceUnlockV1Controls()
 			if _G.autoContestConnection then
 				_G.autoContestConnection:Disconnect()
 				_G.autoContestConnection = nil
 			end
+			_G.autoContestCleanup = nil
 		end
 
 		local function startAutoContestV1()
@@ -1983,14 +2037,7 @@ end
 					local MAX_Y_DELTA = 8
 					local ARRIVE_EPS = 0.4
 					local FACE_GLUE_DIST = 4 -- trigger one-time glue when this close
-					local BIND_NAME = "VantaAutoContestDominant"
-					local FREEZE_ACTION = "VantaContestFreezeMove"
-
-					local contesting = false
 					local didFaceGlue = false -- one-shot glue per contest engagement
-					local controls = nil
-					local oldMoveFunction = nil
-					local controlsDisabled = false
 
 					local function isHoldingG()
 						return char:GetAttribute("HoldingG") == true
@@ -1998,7 +2045,7 @@ end
 
 					-- Grab default ControlModule if present (keyboard + gamepad + touch)
 					local function getControls()
-						if controls then return controls end
+						if v1Controls then return v1Controls end
 						local ok, result = pcall(function()
 							local ps = lp:FindFirstChild("PlayerScripts")
 							if not ps then return nil end
@@ -2011,20 +2058,20 @@ end
 							return mod.controls
 						end)
 						if ok then
-							controls = result
+							v1Controls = result
 						end
-						return controls
+						return v1Controls
 					end
 
 					-- Sink ALL PlayerActions (WASD, arrows, gamepad sticks/buttons, thumbstick move)
 					local function sinkMovement(active)
 						pcall(function()
-							ContextActionService:UnbindAction(FREEZE_ACTION)
+							ContextActionService:UnbindAction(AUTO_CONTEST_FREEZE_ACTION)
 						end)
 						if not active then return end
 						local actions = Enum.PlayerActions:GetEnumItems()
 						ContextActionService:BindActionAtPriority(
-							FREEZE_ACTION,
+							AUTO_CONTEST_FREEZE_ACTION,
 							function()
 								return Enum.ContextActionResult.Sink
 							end,
@@ -2038,9 +2085,9 @@ end
 					local function lockControls(active)
 						local c = getControls()
 						if active then
-							if controlsDisabled then return end
+							if v1ControlsDisabled then return end
 							if c then
-								oldMoveFunction = c.moveFunction
+								v1OldMoveFunction = c.moveFunction
 								c.moveFunction = function() end
 								pcall(function()
 									if typeof(c.Disable) == "function" then
@@ -2049,14 +2096,13 @@ end
 								end)
 							end
 							sinkMovement(true)
-							controlsDisabled = true
+							v1ControlsDisabled = true
 						else
-							if not controlsDisabled then return end
 							sinkMovement(false)
-							if c then
+							if v1ControlsDisabled and c then
 								pcall(function()
-									if oldMoveFunction then
-										c.moveFunction = oldMoveFunction
+									if v1OldMoveFunction then
+										c.moveFunction = v1OldMoveFunction
 									elseif typeof(lp.Move) == "function" then
 										c.moveFunction = lp.Move
 									end
@@ -2065,21 +2111,21 @@ end
 									end
 								end)
 							end
-							controlsDisabled = false
-							oldMoveFunction = nil
+							v1ControlsDisabled = false
+							v1OldMoveFunction = nil
 						end
 					end
 
 					local function beginContestLock()
-						if contesting then return end
-						contesting = true
+						if v1Contesting then return end
+						v1Contesting = true
 						didFaceGlue = false
 						lockControls(true)
 					end
 
 					local function endContestLock()
-						if not contesting then return end
-						contesting = false
+						if not v1Contesting and not v1ControlsDisabled then return end
+						v1Contesting = false
 						didFaceGlue = false
 						lockControls(false)
 					end
@@ -2206,17 +2252,9 @@ end
 					end
 
 					pcall(function()
-						RunService:UnbindFromRenderStep(BIND_NAME)
+						RunService:UnbindFromRenderStep(AUTO_CONTEST_BIND_NAME)
 					end)
-					RunService:BindToRenderStep(BIND_NAME, Enum.RenderPriority.Last.Value + 100, applyContest)
-
-					_G.autoContestCleanup = function()
-						pcall(function()
-							RunService:UnbindFromRenderStep(BIND_NAME)
-						end)
-						endContestLock()
-						_G.autoContestCleanup = nil
-					end
+					RunService:BindToRenderStep(AUTO_CONTEST_BIND_NAME, Enum.RenderPriority.Last.Value + 100, applyContest)
 		end
 
 		local function startAutoContestV2()
