@@ -1,0 +1,1754 @@
+local Library = loadstring(game:HttpGetAsync("https://github.com/ActualMasterOogway/Fluent-Renewed/releases/latest/download/Fluent.luau"))()
+local SaveManager = loadstring(game:HttpGetAsync("https://raw.githubusercontent.com/ActualMasterOogway/Fluent-Renewed/master/Addons/SaveManager.luau"))()
+local InterfaceManager = loadstring(game:HttpGetAsync("https://raw.githubusercontent.com/ActualMasterOogway/Fluent-Renewed/master/Addons/InterfaceManager.luau"))()
+ 
+local Window = Library:CreateWindow{
+    Title = `Killstreak {Library.Version}`,
+    SubTitle = "",
+    TabWidth = 160,
+    Size = UDim2.fromOffset(830, 525),
+    Resize = true, -- Resize this ^ Size according to a 1920x1080 screen, good for mobile users but may look weird on some devices
+    MinSize = Vector2.new(470, 380),
+    Acrylic = true, -- The blur may be detectable, setting this to false disables blur entirely
+    Theme = "Dark",
+    MinimizeKey = Enum.KeyCode.RightControl -- Used when theres no MinimizeKeybind
+}
+
+-- Fluent Renewed provides ALL 1544 Lucide 0.469.0 https://lucide.dev/icons/ Icons and ALL 9072 Phosphor 2.1.0 https://phosphoricons.com/ Icons for the tabs, icons are optional
+local Tabs = {
+    Combat = Window:CreateTab{
+        Title = "Combat",
+        Icon = "crosshair"
+    },
+    Player = Window:CreateTab{
+        Title = "Player",
+        Icon = "user"
+    },
+    Visuals = Window:CreateTab{
+        Title = "Visuals",
+        Icon = "phosphor-users-bold"
+    },
+    Settings = Window:CreateTab{
+        Title = "Settings",
+        Icon = "settings"
+    }
+}
+
+local Options = Library.Options
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local Stats = game:GetService("Stats")
+local Workspace = game:GetService("Workspace")
+local LocalPlayer = Players.LocalPlayer
+local Camera = Workspace.CurrentCamera
+
+-- =====================
+-- Combat / Assist
+-- =====================
+
+local AimMode = "camera"
+local Smoothness = 1
+local FovRadius = 160
+local StickyFovBonus = 40
+local ShowFov = true
+local MaxAimDistance = 350
+local StickyAim = true
+local TeamCheck = false
+local VisibilityCheck = false
+local TargetPart = "Head"
+local HoldKey = Enum.KeyCode.ButtonR2
+local HoldInput = Enum.UserInputType.MouseButton1
+local PredictionEnabled = true
+local PredictionStrength = 0.3
+
+local AimHolding = false
+local LockedTarget = nil
+local MyChar, MyRoot
+local CachedAimPoint = Vector2.zero
+local FrameNow = 0
+local AimActive = false
+
+local AimRayParams = RaycastParams.new()
+AimRayParams.FilterType = Enum.RaycastFilterType.Exclude
+AimRayParams.IgnoreWater = true
+
+local Vim
+pcall(function()
+    Vim = game:GetService("VirtualInputManager")
+end)
+
+local function GetExecutorFn(name)
+    local sources = {getgenv and getgenv(), _G, shared}
+    for i = 1, #sources do
+        local env = sources[i]
+        if type(env) == "table" and typeof(env[name]) == "function" then
+            return env[name]
+        end
+    end
+    return nil
+end
+
+local MouseRel = GetExecutorFn("mousemoverel") or GetExecutorFn("MouseMoveRel")
+
+local function MoveMouse(dx, dy)
+    if MouseRel then
+        pcall(MouseRel, dx, dy)
+    elseif Vim then
+        pcall(Vim.SendMouseMoveDeltaEvent, Vim, dx, dy, nil)
+    end
+end
+
+local function MoveCamera(aimPos, alpha)
+    local cf = Camera.CFrame
+    Camera.CFrame = cf:Lerp(CFrame.lookAt(cf.Position, aimPos), alpha)
+end
+
+local HISTORY = 6
+local PosHistory = {}
+local CachedPing = 60
+local PingClock = 0
+local Clamp = math.clamp
+local Sqrt = math.sqrt
+local Huge = math.huge
+local MaxVel = 100
+
+local function RefreshPing(now)
+    if now - PingClock < 0.75 then
+        return
+    end
+    PingClock = now
+    local ok, ping = pcall(function()
+        return Stats.PerformanceStats.Ping:GetValue()
+    end)
+    if ok and typeof(ping) == "number" then
+        CachedPing = Clamp(ping, 20, 300)
+    end
+end
+
+local function GetHist(plr)
+    local h = PosHistory[plr]
+    if h then
+        return h
+    end
+    h = {
+        n = 0,
+        i = 0,
+        t = table.create(HISTORY),
+        p = table.create(HISTORY),
+        smoothVel = Vector3.zero,
+        smoothAccel = Vector3.zero,
+        smoothAim = nil,
+    }
+    PosHistory[plr] = h
+    return h
+end
+
+local function PushHist(plr, pos, now)
+    local h = GetHist(plr)
+    local prevI = h.i
+    local i = prevI % HISTORY + 1
+    h.i = i
+    h.n = math.min(h.n + 1, HISTORY)
+    h.t[i] = now
+    h.p[i] = pos
+    return h, prevI, i
+end
+
+local function AvgVelocity(h)
+    if h.n < 2 then
+        return Vector3.zero
+    end
+    local oldest = h.i - h.n + 1
+    if oldest < 1 then
+        oldest += HISTORY
+    end
+    local dt = h.t[h.i] - h.t[oldest]
+    if dt < 1e-3 then
+        return Vector3.zero
+    end
+    return (h.p[h.i] - h.p[oldest]) / dt
+end
+
+local function PredictPos(plr, part, dist, now)
+    local raw = part.Position
+    if not PredictionEnabled or PredictionStrength <= 0 then
+        return raw
+    end
+
+    local h = PushHist(plr, raw, now)
+    if h.n < 3 then
+        h.smoothAim = raw
+        return raw
+    end
+
+    local histVel = AvgVelocity(h)
+    local partVel = part.AssemblyLinearVelocity
+    if partVel.Magnitude < 0.05 then
+        partVel = part.Velocity
+    end
+    local vel = histVel:Lerp(partVel, 0.35)
+
+    h.smoothVel = h.smoothVel:Lerp(vel, 0.25)
+    vel = h.smoothVel
+
+    local speed = vel.Magnitude
+    if speed > MaxVel then
+        vel = vel * (MaxVel / speed)
+        speed = MaxVel
+        h.smoothVel = vel
+    end
+
+    local instantAccel = (vel - (h._lastVel or vel)) / math.max(now - (h._lastT or now), 1e-3)
+    h._lastVel = vel
+    h._lastT = now
+    h.smoothAccel = h.smoothAccel:Lerp(instantAccel, 0.12)
+    local accel = h.smoothAccel
+    local aMag = accel.Magnitude
+    if aMag > 80 then
+        accel = accel * (80 / aMag)
+    end
+    if vel:Dot(accel) < 0 then
+        accel = Vector3.zero
+    end
+
+    local t = CachedPing * 0.00055
+    t += Clamp(dist / 550, 0, 0.06)
+    t += Clamp(speed / 280, 0, 0.04)
+    t = Clamp(t, 0.015, 0.14) * Clamp(PredictionStrength, 0, 1)
+
+    local predicted = raw + vel * t + accel * (0.35 * t * t)
+    if h.smoothAim then
+        predicted = h.smoothAim:Lerp(predicted, 0.4)
+    end
+    h.smoothAim = predicted
+    return predicted
+end
+
+Players.PlayerRemoving:Connect(function(plr)
+    PosHistory[plr] = nil
+end)
+
+local function RefreshMe()
+    MyChar = LocalPlayer.Character
+    MyRoot = MyChar and MyChar:FindFirstChild("HumanoidRootPart")
+end
+
+local function SyncAimSettings()
+    local mode = Options.AimMode and Options.AimMode.Value or "Camera"
+    AimMode = string.lower(mode)
+    Smoothness = Options.AimSmoothness and Options.AimSmoothness.Value or 1
+    FovRadius = Options.AimFovRadius and Options.AimFovRadius.Value or 160
+    ShowFov = Options.ShowFov and Options.ShowFov.Value or false
+    MaxAimDistance = Options.AimMaxDistance and Options.AimMaxDistance.Value or 350
+    VisibilityCheck = Options.VisibilityCheck and Options.VisibilityCheck.Value or false
+end
+
+local function UpdateAimPoint()
+    if AimMode == "mouse" then
+        local ok, m = pcall(UserInputService.GetMouseLocation, UserInputService)
+        if ok and m then
+            CachedAimPoint = m
+            return
+        end
+    end
+    local s = Camera.ViewportSize
+    CachedAimPoint = Vector2.new(s.X * 0.5, s.Y * 0.5)
+end
+
+local function FovAt(locked)
+    return locked and (FovRadius + StickyFovBonus) or FovRadius
+end
+
+local function IsValidAimTarget(plr, needFov)
+    if plr == LocalPlayer then
+        return false
+    end
+    if TeamCheck and plr.Team == LocalPlayer.Team then
+        return false
+    end
+
+    local char = plr.Character
+    if not char or not MyRoot then
+        return false
+    end
+
+    local root = char:FindFirstChild("HumanoidRootPart")
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    local part = char:FindFirstChild(TargetPart)
+    if not root or not hum or not part or hum.Health <= 0 then
+        return false
+    end
+
+    local dist = (root.Position - MyRoot.Position).Magnitude
+    if dist > MaxAimDistance then
+        return false
+    end
+
+    local aimPos = PredictPos(plr, part, dist, FrameNow)
+    local screen, onScreen = Camera:WorldToViewportPoint(aimPos)
+    if not onScreen or screen.Z <= 0 then
+        return false
+    end
+
+    if VisibilityCheck then
+        AimRayParams.FilterDescendantsInstances = {Camera, MyChar, char}
+        local hit = Workspace:Raycast(Camera.CFrame.Position, aimPos - Camera.CFrame.Position, AimRayParams)
+        if hit and not hit.Instance:IsDescendantOf(char) then
+            return false
+        end
+    end
+
+    local screenDist = (Vector2.new(screen.X, screen.Y) - CachedAimPoint).Magnitude
+    if needFov and screenDist > FovAt(plr == LockedTarget) then
+        return false
+    end
+
+    return true, aimPos, screenDist
+end
+
+local function GetAimTarget()
+    if StickyAim and LockedTarget then
+        local ok, pos = IsValidAimTarget(LockedTarget, true)
+        if ok then
+            return LockedTarget, pos
+        end
+        LockedTarget = nil
+    end
+
+    local best, bestPos, bestDist = nil, nil, Huge
+    local list = Players:GetPlayers()
+    for i = 1, #list do
+        local plr = list[i]
+        local ok, pos, screenDist = IsValidAimTarget(plr, true)
+        if ok and screenDist < bestDist then
+            best, bestPos, bestDist = plr, pos, screenDist
+        end
+    end
+
+    if StickyAim then
+        LockedTarget = best
+    end
+    return best, bestPos
+end
+
+local function AimAt(aimPos)
+    local screen, on = Camera:WorldToViewportPoint(aimPos)
+    if not on or screen.Z <= 0 then
+        return
+    end
+
+    local errX = screen.X - CachedAimPoint.X
+    local errY = screen.Y - CachedAimPoint.Y
+    local mag = Sqrt(errX * errX + errY * errY)
+    if mag < 1.5 then
+        return
+    end
+
+    local alpha = 1 / (math.max(Smoothness, 1) + 0.5)
+    if mag < 32 then
+        alpha *= Clamp(mag / 32, 0.35, 1)
+    end
+    alpha = Clamp(alpha, 0, 0.9)
+
+    if AimMode == "mouse" then
+        MoveMouse(errX * alpha, errY * alpha)
+    else
+        MoveCamera(aimPos, alpha)
+    end
+end
+
+local FovOutline = Drawing.new("Circle")
+FovOutline.Thickness = 3
+FovOutline.NumSides = 32
+FovOutline.Filled = false
+FovOutline.Color = Color3.new(0, 0, 0)
+FovOutline.ZIndex = 1
+FovOutline.Visible = false
+
+local FovCircle = Drawing.new("Circle")
+FovCircle.Thickness = 1.5
+FovCircle.NumSides = 32
+FovCircle.Filled = false
+FovCircle.Color = Color3.new(1, 1, 1)
+FovCircle.Transparency = 0.35
+FovCircle.ZIndex = 2
+FovCircle.Visible = false
+
+local LastFovCenter = Vector2.zero
+local LastFovR = -1
+
+local function HideFov()
+    if FovCircle.Visible then
+        FovCircle.Visible = false
+        FovOutline.Visible = false
+    end
+end
+
+local function DrawFov()
+    if not ShowFov then
+        HideFov()
+        return
+    end
+
+    local center = CachedAimPoint
+    local r = FovAt(LockedTarget ~= nil)
+    if FovCircle.Visible and (center - LastFovCenter).Magnitude < 0.5 and r == LastFovR then
+        return
+    end
+    LastFovCenter, LastFovR = center, r
+
+    FovOutline.Position = center
+    FovOutline.Radius = r
+    FovOutline.Visible = true
+    FovCircle.Position = center
+    FovCircle.Radius = r
+    FovCircle.Visible = true
+end
+
+local function SetAimHold(state)
+    if AimHolding == state then
+        return
+    end
+    AimHolding = state
+    if not AimHolding then
+        LockedTarget = nil
+    end
+end
+
+local function IsAimHoldInput(input)
+    return input.UserInputType == HoldInput or input.KeyCode == HoldKey
+end
+
+UserInputService.InputBegan:Connect(function(input, processed)
+    if not AimActive then
+        return
+    end
+    if not processed and IsAimHoldInput(input) then
+        SetAimHold(true)
+    end
+end)
+
+UserInputService.InputEnded:Connect(function(input)
+    if IsAimHoldInput(input) then
+        SetAimHold(false)
+    end
+end)
+
+LocalPlayer.CharacterAdded:Connect(function()
+    LockedTarget = nil
+    task.defer(RefreshMe)
+end)
+RefreshMe()
+
+local function AimRenderStep()
+    if not AimActive then
+        return
+    end
+
+    Camera = Workspace.CurrentCamera
+    FrameNow = os.clock()
+    SyncAimSettings()
+    RefreshPing(FrameNow)
+    RefreshMe()
+    UpdateAimPoint()
+    DrawFov()
+
+    if not AimHolding then
+        return
+    end
+
+    local _, aimPos = GetAimTarget()
+    if aimPos then
+        AimAt(aimPos)
+    end
+end
+
+local function DisableAimAssist()
+    AimActive = false
+    AimHolding = false
+    LockedTarget = nil
+    HideFov()
+    pcall(function()
+        RunService:UnbindFromRenderStep("ExternalAim")
+    end)
+end
+
+local function EnableAimAssist()
+    DisableAimAssist()
+    AimActive = true
+    RefreshMe()
+    RunService:BindToRenderStep("ExternalAim", Enum.RenderPriority.Camera.Value + 1, AimRenderStep)
+end
+
+local AssistSection = Tabs.Combat:AddSection("Assist")
+
+AssistSection:AddToggle("AimAssist", {
+    Title = "Aim Assist",
+    Default = false,
+    Callback = function(Value)
+        if Value then
+            EnableAimAssist()
+        else
+            DisableAimAssist()
+        end
+    end
+})
+
+AssistSection:AddDropdown("AimMode", {
+    Title = "Mode",
+    Values = {"Camera", "Mouse"},
+    Multi = false,
+    Default = 1
+})
+
+AssistSection:AddToggle("VisibilityCheck", {
+    Title = "Visibility Check",
+    Default = false
+})
+
+AssistSection:AddToggle("ShowFov", {
+    Title = "Show FOV",
+    Default = true
+})
+
+AssistSection:AddSlider("AimSmoothness", {
+    Title = "Smoothness",
+    Default = 1,
+    Min = 1,
+    Max = 5,
+    Rounding = 1
+})
+
+AssistSection:AddSlider("AimFovRadius", {
+    Title = "FOV Radius",
+    Default = 160,
+    Min = 100,
+    Max = 300,
+    Rounding = 0
+})
+
+AssistSection:AddSlider("AimMaxDistance", {
+    Title = "Max Distance",
+    Default = 400,
+    Min = 400,
+    Max = 1000,
+    Rounding = 0
+})
+
+-- =====================
+-- Player / Speed
+-- =====================
+
+local SpeedConnection
+local SpeedInputConnections = {}
+local SpeedKeyW, SpeedKeyS, SpeedKeyA, SpeedKeyD = 0, 0, 0, 0
+
+local function GetSpeedCharacter()
+    local character = LocalPlayer.Character
+    if not character then
+        return nil
+    end
+    local humanoid = character:FindFirstChildOfClass("Humanoid")
+    local root = character:FindFirstChild("HumanoidRootPart") or character.PrimaryPart
+    if not humanoid or not root or humanoid.Health <= 0 then
+        return nil
+    end
+    return character, humanoid, root
+end
+
+local function CalculateMoveVector(vec)
+    local camera = Workspace.CurrentCamera
+    if not camera then
+        return Vector3.zero
+    end
+    local _, yaw = camera.CFrame:ToOrientation()
+    return CFrame.Angles(0, yaw, 0):VectorToWorldSpace(vec)
+end
+
+local SpeedMethods = {
+    Velocity = function(amount, movevec)
+        local _, _, root = GetSpeedCharacter()
+        if not root or movevec.Magnitude == 0 then
+            return
+        end
+        local velocity = movevec.Unit * amount
+        root.AssemblyLinearVelocity = Vector3.new(velocity.X, root.AssemblyLinearVelocity.Y, velocity.Z)
+    end,
+    Impulse = function(amount, movevec)
+        local _, _, root = GetSpeedCharacter()
+        if not root or movevec.Magnitude == 0 then
+            return
+        end
+        local current = root.AssemblyLinearVelocity
+        local target = movevec.Unit * amount
+        local delta = Vector3.new(target.X - current.X, 0, target.Z - current.Z)
+        root:ApplyImpulse(delta * root.AssemblyMass)
+    end,
+}
+
+local function GetSpeedMoveVector(humanoid)
+    local movevec = humanoid.MoveDirection
+    if movevec.Magnitude > 0 then
+        return movevec
+    end
+
+    local input = Vector3.new(SpeedKeyA + SpeedKeyD, 0, SpeedKeyW + SpeedKeyS)
+    if input.Magnitude == 0 then
+        return Vector3.zero
+    end
+    return CalculateMoveVector(input)
+end
+
+local function DisableSpeed()
+    if SpeedConnection then
+        SpeedConnection:Disconnect()
+        SpeedConnection = nil
+    end
+    for _, connection in pairs(SpeedInputConnections) do
+        connection:Disconnect()
+    end
+    table.clear(SpeedInputConnections)
+    SpeedKeyW, SpeedKeyS, SpeedKeyA, SpeedKeyD = 0, 0, 0, 0
+end
+
+local function EnableSpeed()
+    DisableSpeed()
+
+    SpeedKeyW = UserInputService:IsKeyDown(Enum.KeyCode.W) and -1 or 0
+    SpeedKeyS = UserInputService:IsKeyDown(Enum.KeyCode.S) and 1 or 0
+    SpeedKeyA = UserInputService:IsKeyDown(Enum.KeyCode.A) and -1 or 0
+    SpeedKeyD = UserInputService:IsKeyDown(Enum.KeyCode.D) and 1 or 0
+
+    for _, eventName in ipairs({"InputBegan", "InputEnded"}) do
+        SpeedInputConnections[eventName] = UserInputService[eventName]:Connect(function(input)
+            if UserInputService:GetFocusedTextBox() then
+                return
+            end
+            local pressed = eventName == "InputBegan"
+            if input.KeyCode == Enum.KeyCode.W then
+                SpeedKeyW = pressed and -1 or 0
+            elseif input.KeyCode == Enum.KeyCode.S then
+                SpeedKeyS = pressed and 1 or 0
+            elseif input.KeyCode == Enum.KeyCode.A then
+                SpeedKeyA = pressed and -1 or 0
+            elseif input.KeyCode == Enum.KeyCode.D then
+                SpeedKeyD = pressed and 1 or 0
+            end
+        end)
+    end
+
+    SpeedConnection = RunService.PreSimulation:Connect(function()
+        if not Options.SpeedToggle or not Options.SpeedToggle.Value then
+            return
+        end
+
+        local _, humanoid, root = GetSpeedCharacter()
+        if not humanoid or not root then
+            return
+        end
+
+        local state = humanoid:GetState()
+        if state == Enum.HumanoidStateType.Climbing then
+            return
+        end
+
+        local movevec = GetSpeedMoveVector(humanoid)
+        local mode = Options.SpeedMode and Options.SpeedMode.Value or "Velocity"
+        local amount = Options.SpeedAmount and Options.SpeedAmount.Value or 50
+        local method = SpeedMethods[mode]
+        if method then
+            method(amount, movevec)
+        end
+    end)
+end
+
+local SpeedSection = Tabs.Player:AddSection("Speed")
+
+SpeedSection:AddToggle("SpeedToggle", {
+    Title = "Speed",
+    Default = false,
+    Callback = function(Value)
+        if Value then
+            EnableSpeed()
+        else
+            DisableSpeed()
+        end
+    end
+})
+
+SpeedSection:AddDropdown("SpeedMode", {
+    Title = "Mode",
+    Values = {"Velocity", "Impulse"},
+    Multi = false,
+    Default = 1
+})
+
+SpeedSection:AddSlider("SpeedAmount", {
+    Title = "Amount",
+    Default = 20,
+    Min = 20,
+    Max = 50,
+    Rounding = 0
+})
+
+local MiscSection = Tabs.Player:AddSection("Misc")
+
+local InfJumpConnection
+local InfJumpGamepadHeld = false
+
+local function IsGamepadJumpDown()
+    if InfJumpGamepadHeld then
+        return true
+    end
+
+    for _, inputType in ipairs(UserInputService:GetConnectedGamepads()) do
+        local ok, down = pcall(function()
+            return UserInputService:IsGamepadButtonDown(inputType, Enum.KeyCode.ButtonA)
+        end)
+        if ok and down then
+            return true
+        end
+    end
+
+    -- Fallback for executors where IsKeyDown still works for pads
+    if UserInputService:IsKeyDown(Enum.KeyCode.ButtonA) then
+        return true
+    end
+
+    return false
+end
+
+local function IsInfJumpHeld()
+    return UserInputService:IsKeyDown(Enum.KeyCode.Space) or IsGamepadJumpDown()
+end
+
+local function DisableInfJump()
+    if InfJumpConnection then
+        InfJumpConnection:Disconnect()
+        InfJumpConnection = nil
+    end
+    InfJumpGamepadHeld = false
+end
+
+local function EnableInfJump()
+    DisableInfJump()
+
+    InfJumpConnection = RunService.Heartbeat:Connect(function()
+        if not Options.InfJump or not Options.InfJump.Value then
+            return
+        end
+
+        if not IsInfJumpHeld() then
+            return
+        end
+
+        local character = LocalPlayer.Character
+        if not character then
+            return
+        end
+
+        local humanoid = character:FindFirstChildOfClass("Humanoid")
+        local root = character:FindFirstChild("HumanoidRootPart") or character.PrimaryPart
+        if not humanoid or not root or humanoid.Health <= 0 then
+            return
+        end
+
+        local state = humanoid:GetState()
+        if state == Enum.HumanoidStateType.Seated or state == Enum.HumanoidStateType.Dead then
+            return
+        end
+
+        local jumpPower = 50
+        if humanoid.UseJumpPower then
+            jumpPower = humanoid.JumpPower
+        elseif humanoid.JumpHeight > 0 then
+            jumpPower = math.sqrt(2 * Workspace.Gravity * humanoid.JumpHeight)
+        end
+
+        if root.AssemblyLinearVelocity.Y < jumpPower * 0.9 then
+            root.AssemblyLinearVelocity = Vector3.new(
+                root.AssemblyLinearVelocity.X,
+                jumpPower,
+                root.AssemblyLinearVelocity.Z
+            )
+        end
+    end)
+end
+
+UserInputService.InputBegan:Connect(function(input)
+    if input.KeyCode == Enum.KeyCode.ButtonA then
+        if input.UserInputType == Enum.UserInputType.Gamepad1
+            or input.UserInputType == Enum.UserInputType.Gamepad2
+            or input.UserInputType == Enum.UserInputType.Gamepad3
+            or input.UserInputType == Enum.UserInputType.Gamepad4
+        then
+            InfJumpGamepadHeld = true
+        end
+    end
+end)
+
+UserInputService.InputEnded:Connect(function(input)
+    if input.KeyCode == Enum.KeyCode.ButtonA then
+        if input.UserInputType == Enum.UserInputType.Gamepad1
+            or input.UserInputType == Enum.UserInputType.Gamepad2
+            or input.UserInputType == Enum.UserInputType.Gamepad3
+            or input.UserInputType == Enum.UserInputType.Gamepad4
+        then
+            InfJumpGamepadHeld = false
+        end
+    end
+end)
+
+MiscSection:AddToggle("InfJump", {
+    Title = "InfJump",
+    Default = false,
+    Callback = function(Value)
+        if Value then
+            EnableInfJump()
+        else
+            DisableInfJump()
+        end
+    end
+})
+
+local AutoStrafeConnection
+local AutoStrafeDirection = 1
+local AutoStrafeFlipAccum = 0
+
+local function IsAutoStrafeAttackHeld()
+    if UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton1) then
+        return true
+    end
+
+    for _, inputType in ipairs(UserInputService:GetConnectedGamepads()) do
+        local ok, down = pcall(function()
+            return UserInputService:IsGamepadButtonDown(inputType, Enum.KeyCode.ButtonR2)
+        end)
+        if ok and down then
+            return true
+        end
+    end
+
+    if UserInputService:IsKeyDown(Enum.KeyCode.ButtonR2) then
+        return true
+    end
+
+    return false
+end
+
+local function DisableAutoStrafe()
+    if AutoStrafeConnection then
+        AutoStrafeConnection:Disconnect()
+        AutoStrafeConnection = nil
+    end
+    AutoStrafeDirection = 1
+    AutoStrafeFlipAccum = 0
+end
+
+local function EnableAutoStrafe()
+    DisableAutoStrafe()
+
+    AutoStrafeConnection = RunService.RenderStepped:Connect(function(dt)
+        if not Options.AutoStrafe or not Options.AutoStrafe.Value then
+            return
+        end
+
+        if not IsAutoStrafeAttackHeld() then
+            return
+        end
+
+        AutoStrafeFlipAccum += dt
+        if AutoStrafeFlipAccum >= 0.3 then
+            AutoStrafeFlipAccum = 0
+            AutoStrafeDirection *= -1
+        end
+
+        local _, humanoid, root = GetSpeedCharacter()
+        if not humanoid or not root then
+            return
+        end
+
+        humanoid:Move(Vector3.new(AutoStrafeDirection, 0, 0), true)
+
+        local amount = Options.AutoStrafeAmount and Options.AutoStrafeAmount.Value
+            or (Options.SpeedAmount and Options.SpeedAmount.Value)
+            or 50
+        local mode = Options.SpeedMode and Options.SpeedMode.Value or "Velocity"
+        local method = SpeedMethods[mode]
+        if not method then
+            return
+        end
+
+        local camera = Workspace.CurrentCamera
+        if not camera then
+            return
+        end
+
+        local right = camera.CFrame.RightVector * AutoStrafeDirection
+        local movevec = Vector3.new(right.X, 0, right.Z)
+        if movevec.Magnitude > 0 then
+            method(amount, movevec)
+        end
+    end)
+end
+
+MiscSection:AddToggle("AutoStrafe", {
+    Title = "Auto Strafe",
+    Default = false,
+    Callback = function(Value)
+        if Value then
+            EnableAutoStrafe()
+        else
+            DisableAutoStrafe()
+        end
+    end
+})
+
+MiscSection:AddSlider("AutoStrafeAmount", {
+    Title = "Amount",
+    Default = 35,
+    Min = 35,
+    Max = 100,
+    Rounding = 0
+})
+
+-- =====================
+-- Visuals / ESP
+-- =====================
+
+local ColorMap = {
+    Red = Color3.fromRGB(255, 50, 50),
+    Green = Color3.fromRGB(50, 255, 50),
+    Blue = Color3.fromRGB(50, 120, 255),
+    Yellow = Color3.fromRGB(255, 255, 50),
+    Orange = Color3.fromRGB(255, 140, 40),
+    Purple = Color3.fromRGB(170, 50, 255),
+    Pink = Color3.fromRGB(255, 100, 180),
+    White = Color3.fromRGB(255, 255, 255),
+    Black = Color3.fromRGB(30, 30, 30),
+    Cyan = Color3.fromRGB(50, 255, 255),
+}
+
+local DefaultOutlineColor = Color3.fromRGB(255, 255, 255)
+local FillTransparency = 0.5
+local OutlineTransparency = 0.5
+local DistanceCheckInterval = 0.15
+
+local HealthGreen = Color3.fromRGB(0, 255, 140)
+local HealthYellow = Color3.fromRGB(255, 200, 0)
+local HealthRed = Color3.fromRGB(255, 70, 70)
+
+local ChamReference = {}
+local NametagReference = {}
+local HealthReference = {}
+local Tracked = {}
+local PlayerConnections = {}
+local SharedConnections = {}
+local DistanceConnection
+local DrawingConnection
+local DistanceAccumulator = 0
+local CachedLocalRoot
+local MaxDistanceSq = 500 * 500
+local CachedRenderDistance = 500
+local VisualsActive = false
+
+local RayParams = RaycastParams.new()
+RayParams.FilterType = Enum.RaycastFilterType.Exclude
+RayParams.IgnoreWater = true
+
+local DrawingFont = 2
+pcall(function()
+    if Drawing and Drawing.Fonts then
+        DrawingFont = Drawing.Fonts.UI or Drawing.Fonts.System or 2
+    end
+end)
+
+local function GetGuiParent()
+    if gethui then
+        return gethui()
+    end
+    local ok, coreGui = pcall(function()
+        return game:GetService("CoreGui")
+    end)
+    if ok and coreGui then
+        return coreGui
+    end
+    return LocalPlayer:WaitForChild("PlayerGui")
+end
+
+local Folder = Instance.new("Folder")
+Folder.Name = "ChamsFolder"
+Folder.Parent = GetGuiParent()
+
+local function GetCamera()
+    return Workspace.CurrentCamera
+end
+
+local function GetEspColor()
+    local name = Options.ChamsColor and Options.ChamsColor.Value or "Red"
+    return ColorMap[name] or ColorMap.Red
+end
+
+local function GetRoot(character)
+    if not character then
+        return nil
+    end
+    return character:FindFirstChild("HumanoidRootPart")
+        or character:FindFirstChild("RootPart")
+        or character.PrimaryPart
+end
+
+local function UpdateMaxDistance()
+    CachedRenderDistance = Options.RenderDistance and Options.RenderDistance.Value or 500
+    MaxDistanceSq = CachedRenderDistance * CachedRenderDistance
+end
+
+local function IsPriorityTarget(player)
+    if not Options.PriorityOnly or not Options.PriorityOnly.Value then
+        return true
+    end
+    if LocalPlayer.Team and player.Team and player.Team == LocalPlayer.Team then
+        return false
+    end
+    return true
+end
+
+local function RenderWallsEnabled()
+    return Options.RenderWalls and Options.RenderWalls.Value
+end
+
+local function ChamsEnabled()
+    return Options.Chams and Options.Chams.Value
+end
+
+local function NametagsEnabled()
+    return Options.Nametags and Options.Nametags.Value
+end
+
+local function HealthbarEnabled()
+    return Options.Healthbar and Options.Healthbar.Value
+end
+
+local function AnyOverlayEnabled()
+    return NametagsEnabled() or HealthbarEnabled()
+end
+
+local function AnyVisualEnabled()
+    return ChamsEnabled() or AnyOverlayEnabled()
+end
+
+local function HealthColor(percent)
+    if percent > 0.6 then
+        return HealthGreen
+    elseif percent > 0.3 then
+        return HealthYellow
+    end
+    return HealthRed
+end
+
+local function HasLineOfSight(fromPos, toPos, character)
+    RayParams.FilterDescendantsInstances = {LocalPlayer.Character, character, Folder}
+    return Workspace:Raycast(fromPos, toPos - fromPos, RayParams) == nil
+end
+
+local function SafeRemoveDrawing(obj)
+    if not obj then
+        return
+    end
+    pcall(function()
+        obj.Visible = false
+        obj:Remove()
+    end)
+end
+
+local function HideDrawings(...)
+    for i = 1, select("#", ...) do
+        local obj = select(i, ...)
+        if obj then
+            obj.Visible = false
+        end
+    end
+end
+
+local function RemoveNametag(player)
+    local data = NametagReference[player]
+    if not data then
+        return
+    end
+    SafeRemoveDrawing(data.Text)
+    SafeRemoveDrawing(data.Shadow)
+    NametagReference[player] = nil
+end
+
+local function EnsureNametag(player, displayName)
+    local data = NametagReference[player]
+    if data and data.Text then
+        data.Text.Text = displayName
+        data.Shadow.Text = displayName
+        data.Text.Color = GetEspColor()
+        return data
+    end
+
+    RemoveNametag(player)
+
+    local shadow = Drawing.new("Text")
+    shadow.Center = true
+    shadow.Outline = false
+    shadow.Size = 14
+    shadow.Font = DrawingFont
+    shadow.Color = Color3.new(0, 0, 0)
+    shadow.Transparency = 1
+    shadow.Visible = false
+
+    local text = Drawing.new("Text")
+    text.Center = true
+    text.Outline = true
+    text.OutlineColor = Color3.new(0, 0, 0)
+    text.Size = 14
+    text.Font = DrawingFont
+    text.Color = GetEspColor()
+    text.Transparency = 1
+    text.Text = displayName
+    text.Visible = false
+
+    shadow.Text = displayName
+
+    data = {
+        Text = text,
+        Shadow = shadow,
+    }
+    NametagReference[player] = data
+    return data
+end
+
+local function RemoveHealthbar(player)
+    local data = HealthReference[player]
+    if not data then
+        return
+    end
+    SafeRemoveDrawing(data.Track)
+    SafeRemoveDrawing(data.Fill)
+    SafeRemoveDrawing(data.Border)
+    SafeRemoveDrawing(data.Text)
+    HealthReference[player] = nil
+end
+
+local function EnsureHealthbar(player)
+    local data = HealthReference[player]
+    if data and data.Track then
+        return data
+    end
+
+    RemoveHealthbar(player)
+
+    local track = Drawing.new("Square")
+    track.Filled = true
+    track.Thickness = 0
+    track.Color = Color3.fromRGB(20, 20, 20)
+    track.Transparency = 0.85
+    track.Visible = false
+
+    local border = Drawing.new("Square")
+    border.Filled = false
+    border.Thickness = 1
+    border.Color = Color3.fromRGB(60, 60, 60)
+    border.Transparency = 1
+    border.Visible = false
+
+    local fill = Drawing.new("Square")
+    fill.Filled = true
+    fill.Thickness = 0
+    fill.Color = HealthGreen
+    fill.Transparency = 1
+    fill.Visible = false
+
+    local text = Drawing.new("Text")
+    text.Center = true
+    text.Outline = true
+    text.OutlineColor = Color3.new(0, 0, 0)
+    text.Size = 12
+    text.Font = DrawingFont
+    text.Color = Color3.new(1, 1, 1)
+    text.Transparency = 1
+    text.Visible = false
+
+    data = {
+        Track = track,
+        Border = border,
+        Fill = fill,
+        Text = text,
+    }
+    HealthReference[player] = data
+    return data
+end
+
+local function ApplyChamStyle(cham)
+    cham.DepthMode = Enum.HighlightDepthMode[RenderWallsEnabled() and "AlwaysOnTop" or "Occluded"]
+    cham.FillColor = GetEspColor()
+    cham.OutlineColor = DefaultOutlineColor
+    cham.FillTransparency = FillTransparency
+    cham.OutlineTransparency = OutlineTransparency
+end
+
+local function RemoveCham(player)
+    local cham = ChamReference[player]
+    if cham then
+        cham:Destroy()
+        ChamReference[player] = nil
+    end
+end
+
+local function EnsureCham(player, character)
+    local cham = ChamReference[player]
+    if cham and cham.Parent then
+        if cham.Adornee ~= character then
+            cham.Adornee = character
+        end
+        return cham
+    end
+
+    cham = Instance.new("Highlight")
+    cham.Name = "ChamsHighlight"
+    cham.Adornee = character
+    ApplyChamStyle(cham)
+    cham.Enabled = false
+    cham.Parent = Folder
+    ChamReference[player] = cham
+    return cham
+end
+
+local function RemoveEntity(player)
+    RemoveCham(player)
+    RemoveNametag(player)
+    RemoveHealthbar(player)
+    Tracked[player] = nil
+end
+
+local function CacheEntity(player)
+    if player == LocalPlayer then
+        return
+    end
+
+    if not IsPriorityTarget(player) then
+        RemoveEntity(player)
+        return
+    end
+
+    local character = player.Character
+    local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+    if not character or not humanoid or humanoid.Health <= 0 then
+        RemoveEntity(player)
+        return
+    end
+
+    local existing = Tracked[player]
+    local inRange = existing and existing.InRange or false
+    local hip = humanoid.HipHeight
+    if hip <= 0 then
+        hip = 2
+    end
+
+    Tracked[player] = {
+        Character = character,
+        Root = GetRoot(character),
+        Head = character:FindFirstChild("Head"),
+        Humanoid = humanoid,
+        HipHeight = hip,
+        Name = player.DisplayName ~= "" and player.DisplayName or player.Name,
+        InRange = inRange,
+    }
+
+    if ChamsEnabled() then
+        EnsureCham(player, character)
+    else
+        RemoveCham(player)
+    end
+
+    if NametagsEnabled() then
+        EnsureNametag(player, Tracked[player].Name)
+    else
+        RemoveNametag(player)
+    end
+
+    if HealthbarEnabled() then
+        EnsureHealthbar(player)
+    else
+        RemoveHealthbar(player)
+    end
+end
+
+local function RefreshTracking()
+    for _, player in Players:GetPlayers() do
+        if player ~= LocalPlayer then
+            CacheEntity(player)
+        end
+    end
+end
+
+local function UpdateDistances()
+    CachedLocalRoot = GetRoot(LocalPlayer.Character)
+
+    if not CachedLocalRoot then
+        for player, data in pairs(Tracked) do
+            data.InRange = false
+            local cham = ChamReference[player]
+            if cham then
+                cham.Enabled = false
+            end
+        end
+        return
+    end
+
+    local localPos = CachedLocalRoot.Position
+    local chamsOn = ChamsEnabled()
+
+    for player, data in pairs(Tracked) do
+        local character = player.Character
+        local root = data.Root
+        if not root or root.Parent == nil then
+            root = GetRoot(character)
+            data.Root = root
+            data.Character = character
+            data.Head = character and character:FindFirstChild("Head")
+            data.Humanoid = character and character:FindFirstChildOfClass("Humanoid")
+            if data.Humanoid and data.Humanoid.HipHeight > 0 then
+                data.HipHeight = data.Humanoid.HipHeight
+            end
+
+            if character then
+                if chamsOn then
+                    EnsureCham(player, character)
+                end
+                if NametagsEnabled() then
+                    EnsureNametag(player, data.Name or player.Name)
+                end
+                if HealthbarEnabled() then
+                    EnsureHealthbar(player)
+                end
+            end
+        end
+
+        local inRange = false
+        if root then
+            local offset = localPos - root.Position
+            local distSq = offset.X * offset.X + offset.Y * offset.Y + offset.Z * offset.Z
+            inRange = distSq <= MaxDistanceSq
+        end
+        data.InRange = inRange
+
+        local cham = ChamReference[player]
+        if cham then
+            cham.Enabled = chamsOn and inRange
+        end
+    end
+end
+
+local function UpdateDrawings()
+    if not AnyOverlayEnabled() then
+        return
+    end
+
+    local camera = GetCamera()
+    if not camera then
+        return
+    end
+
+    local nametagsOn = NametagsEnabled()
+    local healthOn = HealthbarEnabled()
+    local walls = RenderWallsEnabled()
+    local color = GetEspColor()
+    local camPos = camera.CFrame.Position
+    local camLook = camera.CFrame.LookVector
+
+    for player, data in pairs(Tracked) do
+        local nametag = NametagReference[player]
+        local health = HealthReference[player]
+        local root = data.Root
+        local head = data.Head
+        local humanoid = data.Humanoid
+        local character = data.Character
+
+        if not data.InRange or not root or not humanoid or humanoid.Health <= 0 then
+            if nametag then
+                HideDrawings(nametag.Text, nametag.Shadow)
+            end
+            if health then
+                HideDrawings(health.Track, health.Fill, health.Border, health.Text)
+            end
+            continue
+        end
+
+        local rootPos, onScreen = camera:WorldToViewportPoint(root.Position)
+        if not onScreen or rootPos.Z <= 0 then
+            if nametag then
+                HideDrawings(nametag.Text, nametag.Shadow)
+            end
+            if health then
+                HideDrawings(health.Track, health.Fill, health.Border, health.Text)
+            end
+            continue
+        end
+
+        if not walls and not HasLineOfSight(camPos, root.Position, character) then
+            if nametag then
+                HideDrawings(nametag.Text, nametag.Shadow)
+            end
+            if health then
+                HideDrawings(health.Track, health.Fill, health.Border, health.Text)
+            end
+            continue
+        end
+
+        local hip = data.HipHeight or 2
+        local topWorld = (CFrame.lookAlong(root.Position, camLook) * CFrame.new(2, hip, 0)).Position
+        local bottomWorld = (CFrame.lookAlong(root.Position, camLook) * CFrame.new(-2, -hip - 1, 0)).Position
+        local topPos = camera:WorldToViewportPoint(topWorld)
+        local bottomPos = camera:WorldToViewportPoint(bottomWorld)
+
+        local sizeX = topPos.X - bottomPos.X
+        local sizeY = topPos.Y - bottomPos.Y
+        local posX = rootPos.X - sizeX * 0.5
+        local posY = rootPos.Y - sizeY * 0.5
+        local distance = rootPos.Z
+        local textSize = math.clamp(2200 / math.max(distance, 1), 10, 16)
+
+        if nametagsOn and nametag then
+            local tagWorld
+            if head and head.Parent then
+                tagWorld = head.Position + Vector3.new(0, head.Size.Y * 0.5 + 0.35, 0)
+            else
+                tagWorld = root.Position + Vector3.new(0, hip + 1.2, 0)
+            end
+
+            local tagPos, tagVisible = camera:WorldToViewportPoint(tagWorld)
+            if tagVisible and tagPos.Z > 0 then
+                local screen = Vector2.new(tagPos.X, tagPos.Y)
+                nametag.Text.Text = data.Name
+                nametag.Shadow.Text = data.Name
+                nametag.Text.Color = color
+                nametag.Text.Size = textSize
+                nametag.Shadow.Size = textSize
+                nametag.Text.Position = screen
+                nametag.Shadow.Position = screen + Vector2.new(1, 1)
+                nametag.Text.Visible = true
+                nametag.Shadow.Visible = true
+            else
+                HideDrawings(nametag.Text, nametag.Shadow)
+            end
+        elseif nametag then
+            HideDrawings(nametag.Text, nametag.Shadow)
+        end
+
+        if healthOn and health then
+            local percent = math.clamp(humanoid.Health / math.max(humanoid.MaxHealth, 1), 0, 1)
+            local barWidth = math.clamp(math.abs(sizeX) * 0.08, 3, 5)
+            local barHeight = math.max(math.abs(sizeY), 12)
+            local barX = posX - barWidth - 5
+            local barY = posY
+            local fillHeight = barHeight * percent
+            local fillY = barY + (barHeight - fillHeight)
+
+            health.Track.Size = Vector2.new(barWidth, barHeight)
+            health.Track.Position = Vector2.new(barX, barY)
+            health.Track.Visible = true
+
+            health.Border.Size = Vector2.new(barWidth, barHeight)
+            health.Border.Position = Vector2.new(barX, barY)
+            health.Border.Visible = true
+
+            health.Fill.Color = HealthColor(percent)
+            health.Fill.Size = Vector2.new(barWidth, fillHeight)
+            health.Fill.Position = Vector2.new(barX, fillY)
+            health.Fill.Visible = percent > 0
+
+            -- Vertical-style HP readout beside the bar
+            health.Text.Text = string.format("%d/%d", math.floor(humanoid.Health), math.floor(humanoid.MaxHealth))
+            health.Text.Size = math.clamp(textSize - 2, 9, 13)
+            health.Text.Position = Vector2.new(barX - 2, barY + barHeight * 0.5)
+            health.Text.Visible = true
+        elseif health then
+            HideDrawings(health.Track, health.Fill, health.Border, health.Text)
+        end
+    end
+end
+
+local function ClearAllVisuals()
+    for player in pairs(ChamReference) do
+        RemoveCham(player)
+    end
+    for player in pairs(NametagReference) do
+        RemoveNametag(player)
+    end
+    for player in pairs(HealthReference) do
+        RemoveHealthbar(player)
+    end
+    table.clear(Tracked)
+end
+
+local function DisconnectPlayerHooks()
+    for _, connection in pairs(PlayerConnections) do
+        connection:Disconnect()
+    end
+    table.clear(PlayerConnections)
+end
+
+local function EnsureDrawingLoop()
+    if DrawingConnection then
+        if not AnyOverlayEnabled() then
+            DrawingConnection:Disconnect()
+            DrawingConnection = nil
+            for player in pairs(NametagReference) do
+                RemoveNametag(player)
+            end
+            for player in pairs(HealthReference) do
+                RemoveHealthbar(player)
+            end
+        end
+        return
+    end
+
+    if not AnyOverlayEnabled() then
+        return
+    end
+
+    DrawingConnection = RunService.RenderStepped:Connect(UpdateDrawings)
+end
+
+local function DisconnectShared()
+    for _, connection in pairs(SharedConnections) do
+        connection:Disconnect()
+    end
+    table.clear(SharedConnections)
+
+    if DistanceConnection then
+        DistanceConnection:Disconnect()
+        DistanceConnection = nil
+    end
+    if DrawingConnection then
+        DrawingConnection:Disconnect()
+        DrawingConnection = nil
+    end
+    DistanceAccumulator = 0
+    VisualsActive = false
+end
+
+local function HookPlayer(player)
+    if player == LocalPlayer then
+        return
+    end
+
+    PlayerConnections[player] = player.CharacterAdded:Connect(function()
+        task.defer(function()
+            if not AnyVisualEnabled() then
+                return
+            end
+            CacheEntity(player)
+            UpdateDistances()
+        end)
+    end)
+
+    if player.Character then
+        CacheEntity(player)
+    end
+end
+
+local function StartVisuals()
+    if VisualsActive then
+        RefreshTracking()
+        EnsureDrawingLoop()
+        UpdateDistances()
+        return
+    end
+
+    DisconnectShared()
+    DisconnectPlayerHooks()
+    ClearAllVisuals()
+    UpdateMaxDistance()
+    VisualsActive = true
+
+    for _, player in Players:GetPlayers() do
+        HookPlayer(player)
+    end
+
+    SharedConnections.PlayerAdded = Players.PlayerAdded:Connect(HookPlayer)
+    SharedConnections.PlayerRemoving = Players.PlayerRemoving:Connect(function(player)
+        if PlayerConnections[player] then
+            PlayerConnections[player]:Disconnect()
+            PlayerConnections[player] = nil
+        end
+        RemoveEntity(player)
+    end)
+
+    SharedConnections.LocalCharacter = LocalPlayer.CharacterAdded:Connect(function(character)
+        CachedLocalRoot = GetRoot(character)
+    end)
+    CachedLocalRoot = GetRoot(LocalPlayer.Character)
+
+    DistanceConnection = RunService.Heartbeat:Connect(function(dt)
+        DistanceAccumulator += dt
+        if DistanceAccumulator < DistanceCheckInterval then
+            return
+        end
+        DistanceAccumulator = 0
+        UpdateDistances()
+    end)
+
+    EnsureDrawingLoop()
+    UpdateDistances()
+end
+
+local function StopVisualsIfIdle()
+    if AnyVisualEnabled() then
+        RefreshTracking()
+        EnsureDrawingLoop()
+        UpdateDistances()
+        return
+    end
+
+    DisconnectShared()
+    DisconnectPlayerHooks()
+    ClearAllVisuals()
+end
+
+local EspSection = Tabs.Visuals:AddSection("ESP")
+
+EspSection:AddToggle("Chams", {
+    Title = "Chams",
+    Default = false,
+    Callback = function(Value)
+        if Value then
+            StartVisuals()
+        else
+            for player in pairs(ChamReference) do
+                RemoveCham(player)
+            end
+            StopVisualsIfIdle()
+        end
+    end
+})
+
+EspSection:AddToggle("Nametags", {
+    Title = "Nametags",
+    Default = false,
+    Callback = function(Value)
+        if Value then
+            StartVisuals()
+        else
+            for player in pairs(NametagReference) do
+                RemoveNametag(player)
+            end
+            StopVisualsIfIdle()
+        end
+    end
+})
+
+EspSection:AddToggle("Healthbar", {
+    Title = "Healthbar",
+    Default = false,
+    Callback = function(Value)
+        if Value then
+            StartVisuals()
+        else
+            for player in pairs(HealthReference) do
+                RemoveHealthbar(player)
+            end
+            StopVisualsIfIdle()
+        end
+    end
+})
+
+local EspSettingsSection = Tabs.Visuals:AddSection("Settings")
+
+EspSettingsSection:AddToggle("RenderWalls", {
+    Title = "Render Walls",
+    Default = false,
+    Callback = function(Value)
+        local mode = Enum.HighlightDepthMode[Value and "AlwaysOnTop" or "Occluded"]
+        for _, cham in pairs(ChamReference) do
+            cham.DepthMode = mode
+        end
+    end
+})
+
+EspSettingsSection:AddToggle("PriorityOnly", {
+    Title = "Priority Only",
+    Default = false,
+    Callback = function()
+        if AnyVisualEnabled() then
+            RefreshTracking()
+            UpdateDistances()
+        end
+    end
+})
+
+EspSettingsSection:AddSlider("RenderDistance", {
+    Title = "Render Distance",
+    Default = 1000,
+    Min = 600,
+    Max = 2000,
+    Rounding = 0,
+    Callback = function()
+        UpdateMaxDistance()
+        if AnyVisualEnabled() then
+            UpdateDistances()
+        end
+    end
+})
+
+EspSettingsSection:AddDropdown("ChamsColor", {
+    Title = "Color",
+    Values = {"Red", "Green", "Blue", "Yellow", "Orange", "Purple", "Pink", "White", "Black", "Cyan"},
+    Multi = false,
+    Default = 1,
+    Callback = function()
+        local color = GetEspColor()
+        for _, cham in pairs(ChamReference) do
+            cham.FillColor = color
+            cham.OutlineColor = DefaultOutlineColor
+        end
+        for _, nametag in pairs(NametagReference) do
+            if nametag.Text then
+                nametag.Text.Color = color
+            end
+        end
+    end
+})
+
+-- Addons:
+-- SaveManager (Allows you to have a configuration system)
+-- InterfaceManager (Allows you to have a interface managment system)
+
+-- Hand the library over to our managers
+SaveManager:SetLibrary(Library)
+InterfaceManager:SetLibrary(Library)
+
+-- Ignore keys that are used by ThemeManager.
+-- (we dont want configs to save themes, do we?)
+SaveManager:IgnoreThemeSettings()
+
+-- You can add indexes of elements the save manager should ignore
+SaveManager:SetIgnoreIndexes{}
+
+-- use case for doing it this way:
+-- a script hub could have themes in a global folder
+-- and game configs in a separate folder per game
+InterfaceManager:SetFolder("FluentScriptHub")
+SaveManager:SetFolder("FluentScriptHub/killstreak")
+
+InterfaceManager:BuildInterfaceSection(Tabs.Settings)
+SaveManager:BuildConfigSection(Tabs.Settings)
+
+
+Window:SelectTab(1)
+
+Library:Notify{
+    Title = "Fluent",
+    Content = "The script has been loaded.",
+    Duration = 8
+}
+
+-- You can use the SaveManager:LoadAutoloadConfig() to load a config
+-- which has been marked to be one that auto loads!
+SaveManager:LoadAutoloadConfig()
