@@ -41,13 +41,297 @@ local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
 local Stats = game:GetService("Stats")
 local Workspace = game:GetService("Workspace")
+local CoreGui = game:GetService("CoreGui")
 local LocalPlayer = Players.LocalPlayer
 local Camera = Workspace.CurrentCamera
+
+-- =====================
+-- Shared targeting (TeamCheck / Target NPCs)
+-- =====================
+
+local LinkingTargetingToggles = false
+local TargetingChangedListeners = {}
+local FireTargetingChanged
+
+local function SyncTargetingToggle(otherKey, value)
+    if LinkingTargetingToggles then
+        return
+    end
+    LinkingTargetingToggles = true
+    local other = Options[otherKey]
+    if other and other.Value ~= value then
+        pcall(function()
+            other:SetValue(value)
+        end)
+    end
+    LinkingTargetingToggles = false
+end
+
+local function IsTeamCheckEnabled()
+    return (Options.TeamCheck and Options.TeamCheck.Value == true)
+        or (Options.VisualsTeamCheck and Options.VisualsTeamCheck.Value == true)
+end
+
+local function IsTargetNPCsEnabled()
+    return (Options.TargetNPCs and Options.TargetNPCs.Value == true)
+        or (Options.VisualsTargetNPCs and Options.VisualsTargetNPCs.Value == true)
+end
+
+local function IsGreenOutline(color)
+    local r, g, b = color.R, color.G, color.B
+    return g > 0.35 and g > r * 1.25 and g > b * 1.25
+end
+
+-- Teammates are marked with a green-outline Highlight (DamageHighlight / others)
+local function HasTeammateMark(character)
+    if not character then
+        return false
+    end
+
+    local hl = character:FindFirstChild("DamageHighlight")
+    if hl and hl:IsA("Highlight") and IsGreenOutline(hl.OutlineColor) then
+        return true
+    end
+
+    for _, child in character:GetChildren() do
+        if child:IsA("Highlight")
+            and child.Name ~= "ChamsHighlight"
+            and child.Name ~= "ChestHighlight"
+            and child.Name ~= "SilentAimTarget"
+            and IsGreenOutline(child.OutlineColor)
+        then
+            return true
+        end
+    end
+
+    return false
+end
+
+local function IsTeammate(character)
+    return IsTeamCheckEnabled() and HasTeammateMark(character)
+end
+
+local function GetCharacterRoot(character)
+    if not character then
+        return nil
+    end
+    return character:FindFirstChild("HumanoidRootPart")
+        or character:FindFirstChild("Torso")
+        or character:FindFirstChild("UpperTorso")
+        or character:FindFirstChild("RootPart")
+        or character.PrimaryPart
+        or character:FindFirstChildWhichIsA("BasePart", true)
+end
+
+local function GetCharacterPart(character, partName)
+    if not character then
+        return nil
+    end
+    if partName and partName ~= "" then
+        local preferred = character:FindFirstChild(partName)
+        if preferred then
+            return preferred
+        end
+    end
+    return character:FindFirstChild("Head") or GetCharacterRoot(character)
+end
+
+-- entityCache[model] = { hum, root, isNpc, player }
+local EntityCache = {}
+local EntityRescanQueued = false
+
+local function UntrackEntity(model)
+    EntityCache[model] = nil
+end
+
+-- NPCs: workspace models with DamageHighlight whose name is not a real Player
+-- e.g. workspace.GhostPine.DamageHighlight
+local function IsNpcModel(model)
+    if not model or not model:IsA("Model") then
+        return false
+    end
+    if model == LocalPlayer.Character then
+        return false
+    end
+    if Players:GetPlayerFromCharacter(model) then
+        return false
+    end
+    if Players:FindFirstChild(model.Name) then
+        return false
+    end
+    local hl = model:FindFirstChild("DamageHighlight")
+    return hl ~= nil and hl:IsA("Highlight")
+end
+
+local function TrackEntityModel(model)
+    if not model or not model:IsA("Model") or not model.Parent then
+        return
+    end
+    if model == LocalPlayer.Character then
+        UntrackEntity(model)
+        return
+    end
+
+    local plr = Players:GetPlayerFromCharacter(model)
+    local isNpc = false
+
+    if plr then
+        if plr == LocalPlayer then
+            UntrackEntity(model)
+            return
+        end
+    elseif IsNpcModel(model) then
+        isNpc = true
+        if not IsTargetNPCsEnabled() then
+            UntrackEntity(model)
+            return
+        end
+    else
+        UntrackEntity(model)
+        return
+    end
+
+    local hum = model:FindFirstChildOfClass("Humanoid")
+    local root = GetCharacterRoot(model)
+    if not root then
+        UntrackEntity(model)
+        return
+    end
+    if hum and hum.Health <= 0 then
+        UntrackEntity(model)
+        return
+    end
+
+    EntityCache[model] = {
+        hum = hum,
+        root = root,
+        isNpc = isNpc,
+        player = plr,
+    }
+end
+
+local function FullEntityRescan()
+    table.clear(EntityCache)
+
+    for _, plr in Players:GetPlayers() do
+        if plr ~= LocalPlayer and plr.Character then
+            TrackEntityModel(plr.Character)
+        end
+    end
+
+    if IsTargetNPCsEnabled() then
+        for _, inst in Workspace:GetDescendants() do
+            if inst:IsA("Highlight") and inst.Name == "DamageHighlight" then
+                local model = inst.Parent
+                if model and model:IsA("Model") then
+                    TrackEntityModel(model)
+                end
+            end
+        end
+    end
+end
+
+local function QueueEntityRescan()
+    if EntityRescanQueued then
+        return
+    end
+    EntityRescanQueued = true
+    task.delay(0.2, function()
+        EntityRescanQueued = false
+        FullEntityRescan()
+    end)
+end
+
+FireTargetingChanged = function()
+    QueueEntityRescan()
+    for i = 1, #TargetingChangedListeners do
+        TargetingChangedListeners[i]()
+    end
+end
+
+local function OnEntityDescendantAdded(inst)
+    if inst:IsA("Model") then
+        task.defer(TrackEntityModel, inst)
+    elseif inst:IsA("Highlight") and inst.Name == "DamageHighlight" then
+        local model = inst.Parent
+        if model and model:IsA("Model") then
+            task.defer(TrackEntityModel, model)
+        end
+    elseif inst:IsA("Humanoid") or inst.Name == "HumanoidRootPart" or inst.Name == "Head" then
+        local model = inst:FindFirstAncestorOfClass("Model")
+        if model then
+            task.defer(TrackEntityModel, model)
+        end
+    end
+end
+
+local function OnEntityDescendantRemoving(inst)
+    if EntityCache[inst] then
+        UntrackEntity(inst)
+    elseif inst:IsA("Highlight") and inst.Name == "DamageHighlight" then
+        local model = inst.Parent
+        if model then
+            UntrackEntity(model)
+        end
+    elseif inst:IsA("Humanoid") or inst.Name == "HumanoidRootPart" then
+        local model = inst.Parent
+        if model and EntityCache[model] then
+            task.defer(TrackEntityModel, model)
+        end
+    end
+end
+
+Workspace.DescendantAdded:Connect(OnEntityDescendantAdded)
+Workspace.DescendantRemoving:Connect(OnEntityDescendantRemoving)
+
+Players.PlayerAdded:Connect(function(plr)
+    plr.CharacterAdded:Connect(function(char)
+        task.defer(TrackEntityModel, char)
+        QueueEntityRescan()
+    end)
+    QueueEntityRescan()
+end)
+
+Players.PlayerRemoving:Connect(function(plr)
+    if plr.Character then
+        UntrackEntity(plr.Character)
+    end
+    QueueEntityRescan()
+end)
+
+for _, plr in Players:GetPlayers() do
+    plr.CharacterAdded:Connect(function(char)
+        task.defer(TrackEntityModel, char)
+        QueueEntityRescan()
+    end)
+    plr.CharacterRemoving:Connect(function(char)
+        UntrackEntity(char)
+    end)
+end
+
+FullEntityRescan()
+
+task.spawn(function()
+    while true do
+        task.wait(3)
+        FullEntityRescan()
+    end
+end)
+
+-- Shared aim scoring (FOV / world distance / camera distance)
+local function CameraTargetScore(screenDist, playerDist, camDist, fovLimit, maxDist)
+    maxDist = math.max(maxDist or 1, 1)
+    local nFov = screenDist / math.max(fovLimit, 1)
+    local nPlayer = playerDist / maxDist
+    local nCam = camDist / maxDist
+    return nFov * 0.45 + nPlayer * 0.3 + nCam * 0.25
+end
 
 -- =====================
 -- Combat / Assist
 -- =====================
 
+do
 local AimMode = "camera"
 local Smoothness = 1
 local FovRadius = 160
@@ -55,7 +339,6 @@ local StickyFovBonus = 40
 local ShowFov = true
 local MaxAimDistance = 350
 local StickyAim = true
-local TeamCheck = false
 local VisibilityCheck = false
 local TargetPart = "Head"
 local HoldKey = Enum.KeyCode.ButtonR2
@@ -171,13 +454,13 @@ local function AvgVelocity(h)
     return (h.p[h.i] - h.p[oldest]) / dt
 end
 
-local function PredictPos(plr, part, dist, now)
+local function PredictPos(histKey, part, dist, now)
     local raw = part.Position
     if not PredictionEnabled or PredictionStrength <= 0 then
         return raw
     end
 
-    local h = PushHist(plr, raw, now)
+    local h = PushHist(histKey, raw, now)
     if h.n < 3 then
         h.smoothAim = raw
         return raw
@@ -261,23 +544,33 @@ local function FovAt(locked)
     return locked and (FovRadius + StickyFovBonus) or FovRadius
 end
 
-local function IsValidAimTarget(plr, needFov)
-    if plr == LocalPlayer then
+local function ResolveAimCharacter(target)
+    if typeof(target) == "Instance" then
+        if target:IsA("Player") then
+            return target.Character, target
+        end
+        if target:IsA("Model") then
+            return target, Players:GetPlayerFromCharacter(target)
+        end
+    end
+    return nil, nil
+end
+
+local function IsValidAimCharacter(character, histKey, needFov, isLocked)
+    if not character or not MyRoot or character == LocalPlayer.Character then
         return false
     end
-    if TeamCheck and plr.Team == LocalPlayer.Team then
+    if IsTeammate(character) then
         return false
     end
 
-    local char = plr.Character
-    if not char or not MyRoot then
+    local root = GetCharacterRoot(character)
+    local hum = character:FindFirstChildOfClass("Humanoid")
+    local part = GetCharacterPart(character, TargetPart)
+    if not root or not part then
         return false
     end
-
-    local root = char:FindFirstChild("HumanoidRootPart")
-    local hum = char:FindFirstChildOfClass("Humanoid")
-    local part = char:FindFirstChild(TargetPart)
-    if not root or not hum or not part or hum.Health <= 0 then
+    if hum and hum.Health <= 0 then
         return false
     end
 
@@ -286,7 +579,7 @@ local function IsValidAimTarget(plr, needFov)
         return false
     end
 
-    local aimPos = PredictPos(plr, part, playerDist, FrameNow)
+    local aimPos = PredictPos(histKey or character, part, playerDist, FrameNow)
     local camPos = Camera.CFrame.Position
     local camDist = (aimPos - camPos).Magnitude
     local screen, onScreen = Camera:WorldToViewportPoint(aimPos)
@@ -295,15 +588,15 @@ local function IsValidAimTarget(plr, needFov)
     end
 
     if VisibilityCheck then
-        AimRayParams.FilterDescendantsInstances = {Camera, MyChar, char}
+        AimRayParams.FilterDescendantsInstances = {Camera, MyChar, character}
         local hit = Workspace:Raycast(camPos, aimPos - camPos, AimRayParams)
-        if hit and not hit.Instance:IsDescendantOf(char) then
+        if hit and not hit.Instance:IsDescendantOf(character) then
             return false
         end
     end
 
     local screenDist = (Vector2.new(screen.X, screen.Y) - CachedAimPoint).Magnitude
-    local fovLimit = FovAt(plr == LockedTarget)
+    local fovLimit = FovAt(isLocked)
     if needFov and screenDist > fovLimit then
         return false
     end
@@ -311,39 +604,75 @@ local function IsValidAimTarget(plr, needFov)
     return true, aimPos, screenDist, playerDist, camDist, fovLimit
 end
 
+local function IsValidAimTarget(target, needFov)
+    local character, plr = ResolveAimCharacter(target)
+    if not character then
+        return false
+    end
+    if plr == LocalPlayer then
+        return false
+    end
+    local histKey = plr or character
+    return IsValidAimCharacter(character, histKey, needFov, target == LockedTarget)
+end
+
 -- Camera mode: pick the target that is closest in FOV, to the local player, and to the camera.
-local function CameraTargetScore(screenDist, playerDist, camDist, fovLimit)
-    local maxDist = math.max(MaxAimDistance, 1)
-    local nFov = screenDist / math.max(fovLimit, 1)
-    local nPlayer = playerDist / maxDist
-    local nCam = camDist / maxDist
-    return nFov * 0.45 + nPlayer * 0.3 + nCam * 0.25
+local function ScoreAimCandidate(ok, pos, screenDist, playerDist, camDist, fovLimit, cameraMode)
+    if not ok then
+        return nil, nil
+    end
+    local score
+    if cameraMode then
+        score = CameraTargetScore(screenDist, playerDist, camDist, fovLimit, MaxAimDistance)
+    else
+        score = screenDist
+    end
+    return pos, score
 end
 
 local function GetAimTarget()
     if StickyAim and LockedTarget then
-        local ok, pos = IsValidAimTarget(LockedTarget, true)
-        if ok then
-            return LockedTarget, pos
+        local character, plr = ResolveAimCharacter(LockedTarget)
+        if character and not plr and not IsTargetNPCsEnabled() then
+            LockedTarget = nil
+        else
+            local ok, pos = IsValidAimTarget(LockedTarget, true)
+            if ok then
+                return LockedTarget, pos
+            end
+            LockedTarget = nil
         end
-        LockedTarget = nil
     end
 
     local best, bestPos, bestScore = nil, nil, Huge
     local cameraMode = AimMode == "camera"
+    local seen = {}
+
     local list = Players:GetPlayers()
     for i = 1, #list do
         local plr = list[i]
-        local ok, pos, screenDist, playerDist, camDist, fovLimit = IsValidAimTarget(plr, true)
-        if ok then
-            local score
-            if cameraMode then
-                score = CameraTargetScore(screenDist, playerDist, camDist, fovLimit)
-            else
-                score = screenDist
+        if plr ~= LocalPlayer then
+            local character = plr.Character
+            if character then
+                seen[character] = true
             end
-            if score < bestScore then
-                best, bestPos, bestScore = plr, pos, score
+            local ok, pos, screenDist, playerDist, camDist, fovLimit = IsValidAimTarget(plr, true)
+            local scoredPos, score = ScoreAimCandidate(ok, pos, screenDist, playerDist, camDist, fovLimit, cameraMode)
+            if scoredPos and score < bestScore then
+                best, bestPos, bestScore = plr, scoredPos, score
+            end
+        end
+    end
+
+    if IsTargetNPCsEnabled() then
+        for model, data in pairs(EntityCache) do
+            if data.isNpc and not seen[model] then
+                local ok, pos, screenDist, playerDist, camDist, fovLimit =
+                    IsValidAimCharacter(model, model, true, model == LockedTarget)
+                local scoredPos, score = ScoreAimCandidate(ok, pos, screenDist, playerDist, camDist, fovLimit, cameraMode)
+                if scoredPos and score < bestScore then
+                    best, bestPos, bestScore = model, scoredPos, score
+                end
             end
         end
     end
@@ -474,7 +803,6 @@ local function AimRenderStep()
     RefreshPing(FrameNow)
     RefreshMe()
     UpdateAimPoint()
-    DrawFov()
 
     if not AimHolding then
         return
@@ -486,11 +814,38 @@ local function AimRenderStep()
     end
 end
 
+-- FOV draws for Aim Assist and/or Magic Bullet
+local function FovRenderStep()
+    local aimOn = Options.AimAssist and Options.AimAssist.Value
+    local magicOn = Options.MagicBullet and Options.MagicBullet.Value
+    if not aimOn and not magicOn then
+        HideFov()
+        return
+    end
+
+    Camera = Workspace.CurrentCamera
+    SyncAimSettings()
+
+    if magicOn or AimMode == "mouse" then
+        local ok, m = pcall(UserInputService.GetMouseLocation, UserInputService)
+        if ok and m then
+            CachedAimPoint = m
+        else
+            UpdateAimPoint()
+        end
+    else
+        UpdateAimPoint()
+    end
+
+    DrawFov()
+end
+
+RunService:BindToRenderStep("KillstreakFov", Enum.RenderPriority.Camera.Value + 2, FovRenderStep)
+
 local function DisableAimAssist()
     AimActive = false
     AimHolding = false
     LockedTarget = nil
-    HideFov()
     pcall(function()
         RunService:UnbindFromRenderStep("ExternalAim")
     end)
@@ -529,11 +884,6 @@ AssistSection:AddToggle("VisibilityCheck", {
     Default = false
 })
 
-AssistSection:AddToggle("ShowFov", {
-    Title = "Show FOV",
-    Default = true
-})
-
 AssistSection:AddSlider("AimSmoothness", {
     Title = "Smoothness",
     Default = 1,
@@ -541,8 +891,256 @@ AssistSection:AddSlider("AimSmoothness", {
     Max = 5,
     Rounding = 1
 })
+end
 
-AssistSection:AddSlider("AimFovRadius", {
+-- =====================
+-- Combat / Experimental (Magic Bullet)
+-- =====================
+
+do
+local MagicBulletConfig = {
+    Enabled = false,
+    Mode = "Mouse",
+    Range = 150,
+    HitChance = 100,
+    TargetPart = "Head",
+    FOV = 150,
+    IgnoredScripts = {"ControlScript", "ControlModule"},
+}
+
+local MagicRand = Random.new()
+local MagicOldNamecall
+local MagicBusy = false
+local MagicHookInstalled = false
+
+local function SyncMagicBulletSettings()
+    MagicBulletConfig.Enabled = Options.MagicBullet and Options.MagicBullet.Value == true
+    MagicBulletConfig.HitChance = Options.MagicHitChance and Options.MagicHitChance.Value or 100
+    MagicBulletConfig.TargetPart = Options.MagicTargetPart and Options.MagicTargetPart.Value or "Head"
+    MagicBulletConfig.FOV = (Options.AimFovRadius and Options.AimFovRadius.Value) or 160
+    MagicBulletConfig.Range = (Options.AimMaxDistance and Options.AimMaxDistance.Value) or 400
+end
+
+local function FindMagicBestTarget(origin)
+    SyncMagicBulletSettings()
+
+    local best, bestPart, bestScore
+    local range = MagicBulletConfig.Range
+    local fov = MagicBulletConfig.FOV
+    local partName = MagicBulletConfig.TargetPart
+    local maxDist = math.max(range, 1)
+
+    local myRoot = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+    local myPos = myRoot and myRoot.Position or origin
+
+    local aimMode = Options.AimMode and string.lower(Options.AimMode.Value or "Camera") or "camera"
+    local aimPoint
+    if aimMode == "mouse" then
+        aimPoint = UserInputService:GetMouseLocation()
+    else
+        local s = Camera.ViewportSize
+        aimPoint = Vector2.new(s.X * 0.5, s.Y * 0.5)
+    end
+
+    for model, data in pairs(EntityCache) do
+        if not model.Parent then
+            EntityCache[model] = nil
+            continue
+        end
+
+        local hum = data.hum
+        local root = data.root
+        if not root or not root.Parent then
+            EntityCache[model] = nil
+            continue
+        end
+        if hum and (not hum.Parent or hum.Health <= 0) then
+            EntityCache[model] = nil
+            continue
+        end
+
+        if data.isNpc and not IsTargetNPCsEnabled() then
+            continue
+        end
+
+        if IsTeammate(model) then
+            continue
+        end
+
+        local part = GetCharacterPart(model, partName) or root
+        if not part then
+            continue
+        end
+
+        local aimPos = part.Position
+        local playerDist = (root.Position - myPos).Magnitude
+        if playerDist > range then
+            continue
+        end
+
+        local camDist = (aimPos - origin).Magnitude
+        if camDist > range then
+            continue
+        end
+
+        local screen, onScreen = Camera:WorldToViewportPoint(aimPos)
+        if not onScreen or screen.Z <= 0 then
+            continue
+        end
+
+        local screenDist = (Vector2.new(screen.X, screen.Y) - aimPoint).Magnitude
+        if screenDist > fov then
+            continue
+        end
+
+        -- Same blend as aim assist camera mode: FOV, in-game distance, camera distance
+        local score = CameraTargetScore(screenDist, playerDist, camDist, fov, maxDist)
+        if not bestScore or score < bestScore then
+            bestScore = score
+            best = model
+            bestPart = part
+        end
+    end
+
+    return best, bestPart
+end
+
+local function GetMagicTarget(origin)
+    if MagicRand:NextNumber(0, 100) > MagicBulletConfig.HitChance then
+        return
+    end
+    return FindMagicBestTarget(origin)
+end
+
+local function ShouldIgnoreMagicCaller()
+    local calling = getcallingscript and getcallingscript()
+    if not calling then
+        return false
+    end
+    return table.find(MagicBulletConfig.IgnoredScripts, tostring(calling)) ~= nil
+end
+
+local function HookMagicScreenPoint(args)
+    local origin = Camera.CFrame.Position
+    local ent, targetPart = GetMagicTarget(origin)
+    if not ent or not targetPart then
+        return
+    end
+
+    local direction = CFrame.lookAt(origin, targetPart.Position)
+    local depth = args[3]
+    local start = origin + (depth and direction.LookVector * depth or Vector3.zero)
+    return {Ray.new(start, direction.LookVector)}
+end
+
+local function MagicNamecallHook(...)
+    local method = getnamecallmethod()
+    if method ~= "ScreenPointToRay" and method ~= "ViewportPointToRay" then
+        return MagicOldNamecall(...)
+    end
+    if MagicBusy or not MagicBulletConfig.Enabled then
+        return MagicOldNamecall(...)
+    end
+    if checkcaller and checkcaller() then
+        return MagicOldNamecall(...)
+    end
+    if ShouldIgnoreMagicCaller() then
+        return MagicOldNamecall(...)
+    end
+
+    if select(1, ...) ~= Camera then
+        return MagicOldNamecall(...)
+    end
+
+    local args = {select(2, ...)}
+
+    MagicBusy = true
+    local ok, redirected = pcall(HookMagicScreenPoint, args)
+    MagicBusy = false
+
+    if ok and redirected then
+        return unpack(redirected)
+    end
+
+    return MagicOldNamecall(...)
+end
+
+local function InstallMagicBulletHook()
+    if MagicHookInstalled then
+        return
+    end
+    if not hookmetamethod then
+        warn("[Magic Bullet] hookmetamethod unavailable")
+        return
+    end
+    MagicOldNamecall = hookmetamethod(
+        game,
+        "__namecall",
+        newcclosure and newcclosure(MagicNamecallHook) or MagicNamecallHook
+    )
+    MagicHookInstalled = true
+end
+
+Workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(function()
+    Camera = Workspace.CurrentCamera
+end)
+
+local ExperimentalSection = Tabs.Combat:AddSection("Experimental")
+
+ExperimentalSection:AddToggle("MagicBullet", {
+    Title = "Magic Bullet",
+    Default = false,
+    Callback = function(Value)
+        if Value then
+            InstallMagicBulletHook()
+            SyncMagicBulletSettings()
+        else
+            MagicBulletConfig.Enabled = false
+        end
+    end
+})
+
+ExperimentalSection:AddDropdown("MagicTargetPart", {
+    Title = "Target Part",
+    Values = {"Head", "HumanoidRootPart", "UpperTorso", "LowerTorso", "Torso"},
+    Multi = false,
+    Default = 1
+})
+
+ExperimentalSection:AddSlider("MagicHitChance", {
+    Title = "Hit Chance",
+    Default = 100,
+    Min = 0,
+    Max = 100,
+    Rounding = 0
+})
+
+local AimSettingsSection = Tabs.Combat:AddSection("Aim Settings")
+
+AimSettingsSection:AddToggle("TeamCheck", {
+    Title = "Team Check",
+    Default = false,
+    Callback = function(Value)
+        SyncTargetingToggle("VisualsTeamCheck", Value)
+        FireTargetingChanged()
+    end
+})
+
+AimSettingsSection:AddToggle("TargetNPCs", {
+    Title = "Target NPCs",
+    Default = false,
+    Callback = function(Value)
+        SyncTargetingToggle("VisualsTargetNPCs", Value)
+        FireTargetingChanged()
+    end
+})
+
+AimSettingsSection:AddToggle("ShowFov", {
+    Title = "Show FOV",
+    Default = true
+})
+
+AimSettingsSection:AddSlider("AimFovRadius", {
     Title = "FOV Radius",
     Default = 160,
     Min = 100,
@@ -550,18 +1148,20 @@ AssistSection:AddSlider("AimFovRadius", {
     Rounding = 0
 })
 
-AssistSection:AddSlider("AimMaxDistance", {
+AimSettingsSection:AddSlider("AimMaxDistance", {
     Title = "Max Distance",
     Default = 400,
     Min = 400,
     Max = 1000,
     Rounding = 0
 })
+end
 
 -- =====================
 -- Player / Speed
 -- =====================
 
+do
 local SpeedConnection
 local SpeedInputConnections = {}
 local SpeedKeyW, SpeedKeyS, SpeedKeyA, SpeedKeyD = 0, 0, 0, 0
@@ -726,7 +1326,7 @@ local function IsGamepadJumpDown()
 
     for _, inputType in ipairs(UserInputService:GetConnectedGamepads()) do
         local ok, down = pcall(function()
-            return UserInputService:IsGamepadButtonDown(inputType, Enum.KeyCode.ButtonA)
+            return UserInputService:IsGamepadButtonDown(inputType, Enum.KeyCode.ButtonL1)
         end)
         if ok and down then
             return true
@@ -734,7 +1334,7 @@ local function IsGamepadJumpDown()
     end
 
     -- Fallback for executors where IsKeyDown still works for pads
-    if UserInputService:IsKeyDown(Enum.KeyCode.ButtonA) then
+    if UserInputService:IsKeyDown(Enum.KeyCode.ButtonL1) then
         return true
     end
 
@@ -934,11 +1534,13 @@ MiscSection:AddSlider("AutoStrafeAmount", {
     Max = 100,
     Rounding = 0
 })
+end
 
 -- =====================
 -- Visuals / ESP
 -- =====================
 
+do
 local ColorMap = {
     Red = Color3.fromRGB(255, 50, 50),
     Green = Color3.fromRGB(50, 255, 50),
@@ -965,6 +1567,7 @@ local ChamReference = {}
 local NametagReference = {}
 local HealthReference = {}
 local Tracked = {}
+local TrackedNpcs = {}
 local PlayerConnections = {}
 local SharedConnections = {}
 local DistanceConnection
@@ -1037,12 +1640,15 @@ local function UpdateMaxDistance()
 end
 
 local function IsPriorityTarget(player)
-    if not Options.PriorityOnly or not Options.PriorityOnly.Value then
-        return true
-    end
-    if LocalPlayer.Team and player.Team and player.Team == LocalPlayer.Team then
+    if player == LocalPlayer then
         return false
     end
+
+    local character = player.Character
+    if character and IsTeammate(character) then
+        return false
+    end
+
     return true
 end
 
@@ -1306,8 +1912,6 @@ local function ResyncChests()
     local origin = nil
     if CachedLocalRoot and CachedLocalRoot.Parent then
         origin = CachedLocalRoot.Position
-    elseif MyRoot and MyRoot.Parent then
-        origin = MyRoot.Position
     else
         local cam = Workspace.CurrentCamera
         origin = cam and cam.CFrame.Position
@@ -1663,6 +2267,69 @@ local function RemoveEntity(player)
     Tracked[player] = nil
 end
 
+local function RemoveNpcEntity(model)
+    RemoveCham(model)
+    RemoveNametag(model)
+    RemoveHealthbar(model)
+    TrackedNpcs[model] = nil
+end
+
+local function CacheNpcEntity(model)
+    if not model or not model.Parent or not IsTargetNPCsEnabled() then
+        RemoveNpcEntity(model)
+        return
+    end
+
+    if IsTeammate(model) then
+        RemoveNpcEntity(model)
+        return
+    end
+
+    local humanoid = model:FindFirstChildOfClass("Humanoid")
+    local root = GetRoot(model) or GetCharacterRoot(model)
+    if not root then
+        RemoveNpcEntity(model)
+        return
+    end
+    if humanoid and humanoid.Health <= 0 then
+        RemoveNpcEntity(model)
+        return
+    end
+
+    local existing = TrackedNpcs[model]
+    local inRange = existing and existing.InRange or false
+    local hip = (humanoid and humanoid.HipHeight > 0 and humanoid.HipHeight) or 2
+
+    TrackedNpcs[model] = {
+        Character = model,
+        Root = root,
+        Head = model:FindFirstChild("Head"),
+        Humanoid = humanoid,
+        HipHeight = hip,
+        Name = model.Name,
+        InRange = inRange,
+        IsNpc = true,
+    }
+
+    if ChamsEnabled() then
+        EnsureCham(model, model)
+    else
+        RemoveCham(model)
+    end
+
+    if NametagsEnabled() then
+        EnsureNametag(model, model.Name)
+    else
+        RemoveNametag(model)
+    end
+
+    if HealthbarEnabled() and humanoid then
+        EnsureHealthbar(model)
+    else
+        RemoveHealthbar(model)
+    end
+end
+
 local function CacheEntity(player)
     if player == LocalPlayer then
         return
@@ -1722,6 +2389,91 @@ local function RefreshTracking()
             CacheEntity(player)
         end
     end
+
+    local keepNpcs = {}
+    if IsTargetNPCsEnabled() and AnyVisualEnabled() then
+        for model, data in pairs(EntityCache) do
+            if data.isNpc and model.Parent then
+                keepNpcs[model] = true
+                CacheNpcEntity(model)
+            end
+        end
+    end
+
+    for model in pairs(TrackedNpcs) do
+        if not keepNpcs[model] then
+            RemoveNpcEntity(model)
+        end
+    end
+end
+
+local function UpdateNpcDistances(localPos, chamsOn)
+    if IsTargetNPCsEnabled() and AnyVisualEnabled() then
+        for model, data in pairs(EntityCache) do
+            if data.isNpc and model.Parent and not TrackedNpcs[model] then
+                CacheNpcEntity(model)
+            end
+        end
+    end
+
+    for model, data in pairs(TrackedNpcs) do
+        if not model.Parent or not IsTargetNPCsEnabled() or IsTeammate(model) then
+            if not model.Parent or not IsTargetNPCsEnabled() then
+                RemoveNpcEntity(model)
+            else
+                data.InRange = false
+                local cham = ChamReference[model]
+                if cham then
+                    cham.Enabled = false
+                end
+            end
+            continue
+        end
+
+        local character = model
+        local root = data.Root
+        if not root or root.Parent == nil then
+            root = GetRoot(character) or GetCharacterRoot(character)
+            data.Root = root
+            data.Head = character:FindFirstChild("Head")
+            data.Humanoid = character:FindFirstChildOfClass("Humanoid")
+            if data.Humanoid and data.Humanoid.HipHeight > 0 then
+                data.HipHeight = data.Humanoid.HipHeight
+            end
+
+            if chamsOn then
+                EnsureCham(model, character)
+            end
+            if NametagsEnabled() then
+                EnsureNametag(model, data.Name or model.Name)
+            end
+            if HealthbarEnabled() and data.Humanoid then
+                EnsureHealthbar(model)
+            end
+        end
+
+        local inRange = false
+        if root then
+            local offset = localPos - root.Position
+            local distSq = offset.X * offset.X + offset.Y * offset.Y + offset.Z * offset.Z
+            inRange = distSq <= MaxDistanceSq
+        end
+        data.InRange = inRange
+
+        local cham = ChamReference[model]
+        if cham then
+            if cham.Adornee ~= character then
+                cham.Adornee = character
+            end
+            cham.Enabled = chamsOn and inRange
+        elseif chamsOn and inRange then
+            EnsureCham(model, character)
+            local created = ChamReference[model]
+            if created then
+                created.Enabled = true
+            end
+        end
+    end
 end
 
 local function UpdateDistances()
@@ -1735,6 +2487,13 @@ local function UpdateDistances()
                 cham.Enabled = false
             end
         end
+        for model, data in pairs(TrackedNpcs) do
+            data.InRange = false
+            local cham = ChamReference[model]
+            if cham then
+                cham.Enabled = false
+            end
+        end
         return
     end
 
@@ -1744,6 +2503,16 @@ local function UpdateDistances()
     for player, data in pairs(Tracked) do
         local character = player.Character
         local root = data.Root
+
+        if character and IsTeammate(character) then
+            data.InRange = false
+            local cham = ChamReference[player]
+            if cham then
+                cham.Enabled = false
+            end
+            continue
+        end
+
         if not root or root.Parent == nil then
             root = GetRoot(character)
             data.Root = root
@@ -1780,6 +2549,8 @@ local function UpdateDistances()
             cham.Enabled = chamsOn and inRange
         end
     end
+
+    UpdateNpcDistances(localPos, chamsOn)
 end
 
 local function UpdateDrawings()
@@ -1799,22 +2570,23 @@ local function UpdateDrawings()
     local camPos = camera.CFrame.Position
     local camLook = camera.CFrame.LookVector
 
-    for player, data in pairs(Tracked) do
-        local nametag = NametagReference[player]
-        local health = HealthReference[player]
+    local function DrawTracked(key, data)
+        local nametag = NametagReference[key]
+        local health = HealthReference[key]
         local root = data.Root
         local head = data.Head
         local humanoid = data.Humanoid
-        local character = data.Character
+        local character = data.Character or (typeof(key) == "Instance" and key:IsA("Player") and key.Character) or key
 
-        if not data.InRange or not root or not humanoid or humanoid.Health <= 0 then
+        local dead = humanoid and humanoid.Health <= 0
+        if not data.InRange or not root or dead then
             if nametag then
                 HideDrawings(nametag.Text, nametag.Shadow)
             end
             if health then
                 HideDrawings(health.Track, health.Fill, health.Border, health.Text)
             end
-            continue
+            return
         end
 
         local rootPos, onScreen = camera:WorldToViewportPoint(root.Position)
@@ -1825,17 +2597,17 @@ local function UpdateDrawings()
             if health then
                 HideDrawings(health.Track, health.Fill, health.Border, health.Text)
             end
-            continue
+            return
         end
 
-        if not walls and not HasLineOfSight(camPos, root.Position, character) then
+        if not walls and character and not HasLineOfSight(camPos, root.Position, character) then
             if nametag then
                 HideDrawings(nametag.Text, nametag.Shadow)
             end
             if health then
                 HideDrawings(health.Track, health.Fill, health.Border, health.Text)
             end
-            continue
+            return
         end
 
         local hip = data.HipHeight or 2
@@ -1878,7 +2650,7 @@ local function UpdateDrawings()
             HideDrawings(nametag.Text, nametag.Shadow)
         end
 
-        if healthOn and health then
+        if healthOn and health and humanoid then
             local percent = math.clamp(humanoid.Health / math.max(humanoid.MaxHealth, 1), 0, 1)
             local barWidth = math.clamp(math.abs(sizeX) * 0.08, 3, 5)
             local barHeight = math.max(math.abs(sizeY), 12)
@@ -1900,7 +2672,6 @@ local function UpdateDrawings()
             health.Fill.Position = Vector2.new(barX, fillY)
             health.Fill.Visible = percent > 0
 
-            -- Vertical-style HP readout beside the bar
             health.Text.Text = string.format("%d/%d", math.floor(humanoid.Health), math.floor(humanoid.MaxHealth))
             health.Text.Size = math.clamp(textSize - 2, 9, 13)
             health.Text.Position = Vector2.new(barX - 2, barY + barHeight * 0.5)
@@ -1908,6 +2679,13 @@ local function UpdateDrawings()
         elseif health then
             HideDrawings(health.Track, health.Fill, health.Border, health.Text)
         end
+    end
+
+    for player, data in pairs(Tracked) do
+        DrawTracked(player, data)
+    end
+    for model, data in pairs(TrackedNpcs) do
+        DrawTracked(model, data)
     end
 end
 
@@ -1922,6 +2700,7 @@ local function ClearAllVisuals()
         RemoveHealthbar(player)
     end
     table.clear(Tracked)
+    table.clear(TrackedNpcs)
 end
 
 local function DisconnectPlayerHooks()
@@ -2125,14 +2904,21 @@ EspSettingsSection:AddToggle("RenderWalls", {
     end
 })
 
-EspSettingsSection:AddToggle("PriorityOnly", {
-    Title = "Priority Only",
+EspSettingsSection:AddToggle("VisualsTeamCheck", {
+    Title = "Team Check",
     Default = false,
-    Callback = function()
-        if AnyVisualEnabled() then
-            RefreshTracking()
-            UpdateDistances()
-        end
+    Callback = function(Value)
+        SyncTargetingToggle("TeamCheck", Value)
+        FireTargetingChanged()
+    end
+})
+
+EspSettingsSection:AddToggle("VisualsTargetNPCs", {
+    Title = "Target NPCs",
+    Default = false,
+    Callback = function(Value)
+        SyncTargetingToggle("TargetNPCs", Value)
+        FireTargetingChanged()
     end
 })
 
@@ -2168,6 +2954,14 @@ EspSettingsSection:AddDropdown("ChamsColor", {
         end
     end
 })
+
+TargetingChangedListeners[#TargetingChangedListeners + 1] = function()
+    if AnyVisualEnabled() then
+        RefreshTracking()
+        UpdateDistances()
+    end
+end
+end
 
 -- Addons:
 -- SaveManager (Allows you to have a configuration system)
