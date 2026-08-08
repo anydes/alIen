@@ -1942,6 +1942,7 @@ end
 		local autoContestMode = "v1"
 		local autoContestActive = false
 		local stopRimRunEnabled = false
+		local constantGlueEnabled = false -- false = one-time glue, true = constant glue
 		local AUTO_CONTEST_BIND_NAME = "VantaAutoContestDominant"
 
 		local function stopAutoContest()
@@ -1967,7 +1968,7 @@ end
 					local TURN_RATE = 12 -- rad-ish blend for facing
 					local POS_SMOOTH = 14 -- exp approach rate
 					local CONTEST_OFFSET = 0.1 -- regular auto contest stand-in-front
-					local GLUE_OFFSET = 4 -- one-time TP/glue stand-in-front
+					local GLUE_OFFSET = 0.5 -- one-time TP/glue stand-in-front
 					local RANGE = 15
 					local MAX_Y_DELTA = 8
 					local ARRIVE_EPS = 0.4
@@ -2062,12 +2063,17 @@ end
 						local distToShooter = (lookAt - Vector3.new(myPos.X, myY, myPos.Z)).Magnitude
 
 						-- Glue snap only when Stop Rim Run is enabled
-						if stopRimRunEnabled and not didFaceGlue and distToShooter <= FACE_GLUE_DIST then
-							local gluePos = contestGoalPos(targetRoot, myY, GLUE_OFFSET)
-							if gluePos then
-								proxyChar.CFrame = hardFace(Vector3.new(gluePos.X, myY, gluePos.Z), lookAt)
-								didFaceGlue = true
-								return
+						-- One Time: snap once per engagement; Constant: keep glued while in range
+						if stopRimRunEnabled and distToShooter <= FACE_GLUE_DIST then
+							if constantGlueEnabled or not didFaceGlue then
+								local gluePos = contestGoalPos(targetRoot, myY, GLUE_OFFSET)
+								if gluePos then
+									proxyChar.CFrame = hardFace(Vector3.new(gluePos.X, myY, gluePos.Z), lookAt)
+									if not constantGlueEnabled then
+										didFaceGlue = true
+									end
+									return
+								end
 							end
 						end
 
@@ -2203,6 +2209,16 @@ end
 			Default = false,
 			Callback = function(enabled)
 				stopRimRunEnabled = enabled
+			end
+		})
+
+		Tabs.DefenseTab:Toggle({
+			Flag = "ConstantGlueToggle",
+			Title = "Constant Glue",
+			Desc = "Off = one-time glue, On = constant glue",
+			Default = false,
+			Callback = function(enabled)
+				constantGlueEnabled = enabled
 			end
 		})
 
