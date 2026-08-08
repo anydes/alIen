@@ -281,12 +281,14 @@ local function IsValidAimTarget(plr, needFov)
         return false
     end
 
-    local dist = (root.Position - MyRoot.Position).Magnitude
-    if dist > MaxAimDistance then
+    local playerDist = (root.Position - MyRoot.Position).Magnitude
+    if playerDist > MaxAimDistance then
         return false
     end
 
-    local aimPos = PredictPos(plr, part, dist, FrameNow)
+    local aimPos = PredictPos(plr, part, playerDist, FrameNow)
+    local camPos = Camera.CFrame.Position
+    local camDist = (aimPos - camPos).Magnitude
     local screen, onScreen = Camera:WorldToViewportPoint(aimPos)
     if not onScreen or screen.Z <= 0 then
         return false
@@ -294,18 +296,28 @@ local function IsValidAimTarget(plr, needFov)
 
     if VisibilityCheck then
         AimRayParams.FilterDescendantsInstances = {Camera, MyChar, char}
-        local hit = Workspace:Raycast(Camera.CFrame.Position, aimPos - Camera.CFrame.Position, AimRayParams)
+        local hit = Workspace:Raycast(camPos, aimPos - camPos, AimRayParams)
         if hit and not hit.Instance:IsDescendantOf(char) then
             return false
         end
     end
 
     local screenDist = (Vector2.new(screen.X, screen.Y) - CachedAimPoint).Magnitude
-    if needFov and screenDist > FovAt(plr == LockedTarget) then
+    local fovLimit = FovAt(plr == LockedTarget)
+    if needFov and screenDist > fovLimit then
         return false
     end
 
-    return true, aimPos, screenDist
+    return true, aimPos, screenDist, playerDist, camDist, fovLimit
+end
+
+-- Camera mode: pick the target that is closest in FOV, to the local player, and to the camera.
+local function CameraTargetScore(screenDist, playerDist, camDist, fovLimit)
+    local maxDist = math.max(MaxAimDistance, 1)
+    local nFov = screenDist / math.max(fovLimit, 1)
+    local nPlayer = playerDist / maxDist
+    local nCam = camDist / maxDist
+    return nFov * 0.45 + nPlayer * 0.3 + nCam * 0.25
 end
 
 local function GetAimTarget()
@@ -317,13 +329,22 @@ local function GetAimTarget()
         LockedTarget = nil
     end
 
-    local best, bestPos, bestDist = nil, nil, Huge
+    local best, bestPos, bestScore = nil, nil, Huge
+    local cameraMode = AimMode == "camera"
     local list = Players:GetPlayers()
     for i = 1, #list do
         local plr = list[i]
-        local ok, pos, screenDist = IsValidAimTarget(plr, true)
-        if ok and screenDist < bestDist then
-            best, bestPos, bestDist = plr, pos, screenDist
+        local ok, pos, screenDist, playerDist, camDist, fovLimit = IsValidAimTarget(plr, true)
+        if ok then
+            local score
+            if cameraMode then
+                score = CameraTargetScore(screenDist, playerDist, camDist, fovLimit)
+            else
+                score = screenDist
+            end
+            if score < bestScore then
+                best, bestPos, bestScore = plr, pos, score
+            end
         end
     end
 
@@ -954,6 +975,16 @@ local MaxDistanceSq = 500 * 500
 local CachedRenderDistance = 500
 local VisualsActive = false
 
+local ChestFolderName = "BR_Chests"
+local ChestColor = Color3.fromRGB(255, 200, 50)
+local ChestHighlights = {}
+local ChestPartWaiters = {}
+local ChestConnections = {}
+local ChestFolder = nil
+local ChestActive = false
+local ChestScanAccum = 0
+local ChestScanInterval = 0.35
+
 local RayParams = RaycastParams.new()
 RayParams.FilterType = Enum.RaycastFilterType.Exclude
 RayParams.IgnoreWater = true
@@ -1037,6 +1068,221 @@ end
 
 local function AnyVisualEnabled()
     return ChamsEnabled() or AnyOverlayEnabled()
+end
+
+local function ChestEspEnabled()
+    return Options.ChestEsp and Options.ChestEsp.Value
+end
+
+local function ApplyChestHighlightStyle(hl)
+    hl.DepthMode = Enum.HighlightDepthMode[RenderWallsEnabled() and "AlwaysOnTop" or "Occluded"]
+    hl.FillColor = ChestColor
+    hl.OutlineColor = DefaultOutlineColor
+    hl.FillTransparency = FillTransparency
+    hl.OutlineTransparency = OutlineTransparency
+end
+
+local function ClearChestPartWaiter(model)
+    local conn = ChestPartWaiters[model]
+    if conn then
+        conn:Disconnect()
+        ChestPartWaiters[model] = nil
+    end
+end
+
+local function RemoveChestHighlight(model)
+    ClearChestPartWaiter(model)
+    local hl = ChestHighlights[model]
+    if hl then
+        hl:Destroy()
+        ChestHighlights[model] = nil
+    end
+end
+
+local function ClearChestHighlights()
+    for model in pairs(ChestHighlights) do
+        RemoveChestHighlight(model)
+    end
+    for model in pairs(ChestPartWaiters) do
+        ClearChestPartWaiter(model)
+    end
+end
+
+local function ModelHasVisualPart(model)
+    if not model then
+        return false
+    end
+    if model.PrimaryPart then
+        return true
+    end
+    return model:FindFirstChildWhichIsA("MeshPart", true) ~= nil
+        or model:FindFirstChildWhichIsA("BasePart", true) ~= nil
+end
+
+local function EnsureChestHighlight(model)
+    if not ChestEspEnabled() or not model or not model:IsA("Model") then
+        return
+    end
+    if ChestFolder and model.Parent ~= ChestFolder then
+        return
+    end
+
+    if not ModelHasVisualPart(model) then
+        if not ChestPartWaiters[model] then
+            ChestPartWaiters[model] = model.DescendantAdded:Connect(function(desc)
+                if desc:IsA("MeshPart") or desc:IsA("BasePart") then
+                    ClearChestPartWaiter(model)
+                    EnsureChestHighlight(model)
+                end
+            end)
+        end
+        return
+    end
+
+    ClearChestPartWaiter(model)
+
+    local hl = ChestHighlights[model]
+    if hl and hl.Parent then
+        if hl.Adornee ~= model then
+            hl.Adornee = model
+        end
+        ApplyChestHighlightStyle(hl)
+        hl.Enabled = true
+        return hl
+    end
+
+    hl = Instance.new("Highlight")
+    hl.Name = "ChestHighlight"
+    hl.Adornee = model
+    ApplyChestHighlightStyle(hl)
+    hl.Enabled = true
+    hl.Parent = Folder
+    ChestHighlights[model] = hl
+    return hl
+end
+
+local function ScanChestFolder()
+    if not ChestEspEnabled() or not ChestFolder then
+        return
+    end
+
+    for _, child in ipairs(ChestFolder:GetChildren()) do
+        if child:IsA("Model") then
+            EnsureChestHighlight(child)
+        end
+    end
+
+    for model in pairs(ChestHighlights) do
+        if not model.Parent or model.Parent ~= ChestFolder then
+            RemoveChestHighlight(model)
+        end
+    end
+
+    for model in pairs(ChestPartWaiters) do
+        if not model.Parent or model.Parent ~= ChestFolder then
+            ClearChestPartWaiter(model)
+        end
+    end
+end
+
+local function UnhookChestFolderWatchers()
+    if ChestConnections.ChildAdded then
+        ChestConnections.ChildAdded:Disconnect()
+        ChestConnections.ChildAdded = nil
+    end
+    if ChestConnections.ChildRemoved then
+        ChestConnections.ChildRemoved:Disconnect()
+        ChestConnections.ChildRemoved = nil
+    end
+end
+
+local function HookChestFolder(folder)
+    if not folder then
+        return
+    end
+
+    UnhookChestFolderWatchers()
+    ChestFolder = folder
+
+    ChestConnections.ChildAdded = folder.ChildAdded:Connect(function(child)
+        if not ChestEspEnabled() then
+            return
+        end
+        if child:IsA("Model") then
+            task.defer(EnsureChestHighlight, child)
+        end
+    end)
+
+    ChestConnections.ChildRemoved = folder.ChildRemoved:Connect(function(child)
+        RemoveChestHighlight(child)
+    end)
+
+    ScanChestFolder()
+end
+
+local function DisableChestEsp()
+    if ChestConnections.Heartbeat then
+        ChestConnections.Heartbeat:Disconnect()
+        ChestConnections.Heartbeat = nil
+    end
+    if ChestConnections.FolderAdded then
+        ChestConnections.FolderAdded:Disconnect()
+        ChestConnections.FolderAdded = nil
+    end
+    if ChestConnections.FolderRemoved then
+        ChestConnections.FolderRemoved:Disconnect()
+        ChestConnections.FolderRemoved = nil
+    end
+    UnhookChestFolderWatchers()
+    ClearChestHighlights()
+    ChestFolder = nil
+    ChestActive = false
+    ChestScanAccum = 0
+end
+
+local function EnableChestEsp()
+    DisableChestEsp()
+    ChestActive = true
+
+    local existing = Workspace:FindFirstChild(ChestFolderName)
+    if existing then
+        HookChestFolder(existing)
+    end
+
+    ChestConnections.FolderAdded = Workspace.ChildAdded:Connect(function(child)
+        if child.Name == ChestFolderName then
+            HookChestFolder(child)
+        end
+    end)
+
+    ChestConnections.FolderRemoved = Workspace.ChildRemoved:Connect(function(child)
+        if child == ChestFolder or child.Name == ChestFolderName then
+            UnhookChestFolderWatchers()
+            ClearChestHighlights()
+            ChestFolder = nil
+        end
+    end)
+
+    ChestConnections.Heartbeat = RunService.Heartbeat:Connect(function(dt)
+        if not ChestEspEnabled() then
+            return
+        end
+
+        if not ChestFolder then
+            local folder = Workspace:FindFirstChild(ChestFolderName)
+            if folder then
+                HookChestFolder(folder)
+            end
+            return
+        end
+
+        ChestScanAccum += dt
+        if ChestScanAccum < ChestScanInterval then
+            return
+        end
+        ChestScanAccum = 0
+        ScanChestFolder()
+    end)
 end
 
 local function HealthColor(percent)
@@ -1659,6 +1905,18 @@ EspSection:AddToggle("Healthbar", {
     end
 })
 
+EspSection:AddToggle("ChestEsp", {
+    Title = "Chest ESP",
+    Default = false,
+    Callback = function(Value)
+        if Value then
+            EnableChestEsp()
+        else
+            DisableChestEsp()
+        end
+    end
+})
+
 local EspSettingsSection = Tabs.Visuals:AddSection("Settings")
 
 EspSettingsSection:AddToggle("RenderWalls", {
@@ -1668,6 +1926,9 @@ EspSettingsSection:AddToggle("RenderWalls", {
         local mode = Enum.HighlightDepthMode[Value and "AlwaysOnTop" or "Occluded"]
         for _, cham in pairs(ChamReference) do
             cham.DepthMode = mode
+        end
+        for _, hl in pairs(ChestHighlights) do
+            hl.DepthMode = mode
         end
     end
 })
