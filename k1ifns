@@ -977,13 +977,13 @@ local VisualsActive = false
 
 local ChestFolderName = "BR_Chests"
 local ChestColor = Color3.fromRGB(255, 200, 50)
-local ChestHighlights = {}
-local ChestPartWaiters = {}
+local ChestHighlights = {} -- [BasePart] = Highlight
 local ChestConnections = {}
 local ChestFolder = nil
 local ChestActive = false
 local ChestScanAccum = 0
-local ChestScanInterval = 0.35
+local ChestScanInterval = 0.1
+local MaxChestHighlights = 30
 
 local RayParams = RaycastParams.new()
 RayParams.FilterType = Enum.RaycastFilterType.Exclude
@@ -1074,125 +1074,197 @@ local function ChestEspEnabled()
     return Options.ChestEsp and Options.ChestEsp.Value
 end
 
-local function ApplyChestHighlightStyle(hl)
-    hl.DepthMode = Enum.HighlightDepthMode[RenderWallsEnabled() and "AlwaysOnTop" or "Occluded"]
-    hl.FillColor = ChestColor
-    hl.OutlineColor = DefaultOutlineColor
-    hl.FillTransparency = FillTransparency
-    hl.OutlineTransparency = OutlineTransparency
+local function IsChestVisualPart(inst)
+    return typeof(inst) == "Instance" and inst:IsA("BasePart")
 end
 
-local function ClearChestPartWaiter(model)
-    local conn = ChestPartWaiters[model]
-    if conn then
-        conn:Disconnect()
-        ChestPartWaiters[model] = nil
+local function FindChestFolder()
+    local direct = Workspace:FindFirstChild(ChestFolderName)
+    if direct then
+        return direct
     end
+
+    local nestedWs = Workspace:FindFirstChild("Workspace")
+    if nestedWs then
+        local nested = nestedWs:FindFirstChild(ChestFolderName)
+        if nested then
+            return nested
+        end
+    end
+
+    return Workspace:FindFirstChild(ChestFolderName, true)
 end
 
-local function RemoveChestHighlight(model)
-    ClearChestPartWaiter(model)
-    local hl = ChestHighlights[model]
+local function ApplyChestHighlightStyle(hl)
+    pcall(function()
+        hl.DepthMode = Enum.HighlightDepthMode[RenderWallsEnabled() and "AlwaysOnTop" or "Occluded"]
+        hl.FillColor = ChestColor
+        hl.OutlineColor = DefaultOutlineColor
+        hl.FillTransparency = 0.35
+        hl.OutlineTransparency = 0
+        hl.Enabled = true
+    end)
+end
+
+local function DestroyChestHighlight(part)
+    local hl = ChestHighlights[part]
+    ChestHighlights[part] = nil
     if hl then
-        hl:Destroy()
-        ChestHighlights[model] = nil
+        pcall(function()
+            hl:Destroy()
+        end)
     end
 end
 
 local function ClearChestHighlights()
-    for model in pairs(ChestHighlights) do
-        RemoveChestHighlight(model)
+    for part in pairs(ChestHighlights) do
+        DestroyChestHighlight(part)
     end
-    for model in pairs(ChestPartWaiters) do
-        ClearChestPartWaiter(model)
-    end
+    table.clear(ChestHighlights)
 end
 
-local function ModelHasVisualPart(model)
-    if not model then
-        return false
-    end
-    if model.PrimaryPart then
-        return true
-    end
-    return model:FindFirstChildWhichIsA("MeshPart", true) ~= nil
-        or model:FindFirstChildWhichIsA("BasePart", true) ~= nil
-end
-
-local function EnsureChestHighlight(model)
-    if not ChestEspEnabled() or not model or not model:IsA("Model") then
-        return
-    end
-    if ChestFolder and model.Parent ~= ChestFolder then
-        return
+local function CollectChestParts(folder)
+    local parts = {}
+    local seen = {}
+    if not folder then
+        return parts
     end
 
-    if not ModelHasVisualPart(model) then
-        if not ChestPartWaiters[model] then
-            ChestPartWaiters[model] = model.DescendantAdded:Connect(function(desc)
-                if desc:IsA("MeshPart") or desc:IsA("BasePart") then
-                    ClearChestPartWaiter(model)
-                    EnsureChestHighlight(model)
+    local function add(part)
+        if part and not seen[part] and part:IsA("BasePart") then
+            seen[part] = true
+            parts[#parts + 1] = part
+        end
+    end
+
+    for _, child in ipairs(folder:GetChildren()) do
+        if child:IsA("Model") or child:IsA("Folder") then
+            if child:IsA("Model") and child.PrimaryPart then
+                add(child.PrimaryPart)
+            end
+            for _, desc in ipairs(child:GetDescendants()) do
+                if desc:IsA("MeshPart") or desc:IsA("Part") then
+                    add(desc)
                 end
-            end)
+            end
+        elseif IsChestVisualPart(child) then
+            add(child)
         end
+    end
+
+    return parts
+end
+
+local function RankChestParts(parts)
+    local origin = nil
+    if MyRoot then
+        origin = MyRoot.Position
+    elseif CachedLocalRoot then
+        origin = CachedLocalRoot.Position
+    else
+        local cam = Workspace.CurrentCamera
+        origin = cam and cam.CFrame.Position
+    end
+
+    if not origin then
+        return parts
+    end
+
+    table.sort(parts, function(a, b)
+        local da = (a.Position - origin).Magnitude
+        local db = (b.Position - origin).Magnitude
+        return da < db
+    end)
+    return parts
+end
+
+local function EnsureChestPartHighlight(part)
+    if not ChestEspEnabled() or not IsChestVisualPart(part) or not part.Parent then
+        return
+    end
+    if ChestFolder and not part:IsDescendantOf(ChestFolder) then
         return
     end
 
-    ClearChestPartWaiter(model)
-
-    local hl = ChestHighlights[model]
-    if hl and hl.Parent then
-        if hl.Adornee ~= model then
-            hl.Adornee = model
+    local hl = ChestHighlights[part]
+    if hl then
+        local alive = false
+        pcall(function()
+            alive = hl.Parent ~= nil
+        end)
+        if not alive then
+            ChestHighlights[part] = nil
+            hl = nil
         end
-        ApplyChestHighlightStyle(hl)
-        hl.Enabled = true
+    end
+
+    if hl then
+        pcall(function()
+            hl.Adornee = part
+            if hl.Parent ~= Folder then
+                hl.Parent = Folder
+            end
+            ApplyChestHighlightStyle(hl)
+        end)
         return hl
     end
 
-    hl = Instance.new("Highlight")
-    hl.Name = "ChestHighlight"
-    hl.Adornee = model
-    ApplyChestHighlightStyle(hl)
-    hl.Enabled = true
-    hl.Parent = Folder
-    ChestHighlights[model] = hl
-    return hl
+    local ok, created = pcall(function()
+        local h = Instance.new("Highlight")
+        h.Name = "ChestHighlight"
+        h.Adornee = part
+        ApplyChestHighlightStyle(h)
+        h.Parent = Folder
+        return h
+    end)
+
+    if ok and created then
+        ChestHighlights[part] = created
+        return created
+    end
 end
 
-local function ScanChestFolder()
-    if not ChestEspEnabled() or not ChestFolder then
+local function RehighlightChests()
+    if not ChestEspEnabled() then
         return
     end
 
-    for _, child in ipairs(ChestFolder:GetChildren()) do
-        if child:IsA("Model") then
-            EnsureChestHighlight(child)
+    if not ChestFolder or not ChestFolder.Parent then
+        ChestFolder = FindChestFolder()
+        if not ChestFolder then
+            ClearChestHighlights()
+            return
         end
     end
 
-    for model in pairs(ChestHighlights) do
-        if not model.Parent or model.Parent ~= ChestFolder then
-            RemoveChestHighlight(model)
-        end
+    local parts = RankChestParts(CollectChestParts(ChestFolder))
+    local keep = {}
+
+    local limit = math.min(#parts, MaxChestHighlights)
+    for i = 1, limit do
+        local part = parts[i]
+        keep[part] = true
+        EnsureChestPartHighlight(part)
     end
 
-    for model in pairs(ChestPartWaiters) do
-        if not model.Parent or model.Parent ~= ChestFolder then
-            ClearChestPartWaiter(model)
+    for part in pairs(ChestHighlights) do
+        if not keep[part] or not part.Parent or (ChestFolder and not part:IsDescendantOf(ChestFolder)) then
+            DestroyChestHighlight(part)
+        else
+            -- Force refresh every scan so destroyed/disabled highlights come back
+            EnsureChestPartHighlight(part)
         end
     end
 end
 
 local function UnhookChestFolderWatchers()
-    if ChestConnections.ChildAdded then
-        ChestConnections.ChildAdded:Disconnect()
-        ChestConnections.ChildAdded = nil
-    end
-    if ChestConnections.ChildRemoved then
-        ChestConnections.ChildRemoved:Disconnect()
-        ChestConnections.ChildRemoved = nil
+    local keys = {"ChildAdded", "ChildRemoved", "DescendantAdded", "DescendantRemoving"}
+    for i = 1, #keys do
+        local key = keys[i]
+        if ChestConnections[key] then
+            ChestConnections[key]:Disconnect()
+            ChestConnections[key] = nil
+        end
     end
 end
 
@@ -1204,20 +1276,40 @@ local function HookChestFolder(folder)
     UnhookChestFolderWatchers()
     ChestFolder = folder
 
-    ChestConnections.ChildAdded = folder.ChildAdded:Connect(function(child)
+    ChestConnections.DescendantAdded = folder.DescendantAdded:Connect(function(desc)
         if not ChestEspEnabled() then
             return
         end
-        if child:IsA("Model") then
-            task.defer(EnsureChestHighlight, child)
+        if IsChestVisualPart(desc) then
+            task.defer(function()
+                EnsureChestPartHighlight(desc)
+                RehighlightChests()
+            end)
+        end
+    end)
+
+    ChestConnections.DescendantRemoving = folder.DescendantRemoving:Connect(function(desc)
+        if IsChestVisualPart(desc) then
+            DestroyChestHighlight(desc)
+        end
+    end)
+
+    ChestConnections.ChildAdded = folder.ChildAdded:Connect(function()
+        if ChestEspEnabled() then
+            task.defer(RehighlightChests)
         end
     end)
 
     ChestConnections.ChildRemoved = folder.ChildRemoved:Connect(function(child)
-        RemoveChestHighlight(child)
+        for part in pairs(ChestHighlights) do
+            if part == child or (part.Parent and part:IsDescendantOf(child)) then
+                DestroyChestHighlight(part)
+            end
+        end
+        task.defer(RehighlightChests)
     end)
 
-    ScanChestFolder()
+    RehighlightChests()
 end
 
 local function DisableChestEsp()
@@ -1243,23 +1335,31 @@ end
 local function EnableChestEsp()
     DisableChestEsp()
     ChestActive = true
+    RefreshMe()
 
-    local existing = Workspace:FindFirstChild(ChestFolderName)
+    local existing = FindChestFolder()
     if existing then
         HookChestFolder(existing)
     end
 
-    ChestConnections.FolderAdded = Workspace.ChildAdded:Connect(function(child)
-        if child.Name == ChestFolderName then
-            HookChestFolder(child)
+    ChestConnections.FolderAdded = Workspace.DescendantAdded:Connect(function(desc)
+        if desc.Name == ChestFolderName then
+            HookChestFolder(desc)
+        elseif ChestEspEnabled() and ChestFolder and IsChestVisualPart(desc) and desc:IsDescendantOf(ChestFolder) then
+            task.defer(function()
+                EnsureChestPartHighlight(desc)
+                RehighlightChests()
+            end)
         end
     end)
 
-    ChestConnections.FolderRemoved = Workspace.ChildRemoved:Connect(function(child)
-        if child == ChestFolder or child.Name == ChestFolderName then
+    ChestConnections.FolderRemoved = Workspace.DescendantRemoving:Connect(function(desc)
+        if desc == ChestFolder or (desc.Name == ChestFolderName and desc == ChestFolder) then
             UnhookChestFolderWatchers()
             ClearChestHighlights()
             ChestFolder = nil
+        elseif IsChestVisualPart(desc) then
+            DestroyChestHighlight(desc)
         end
     end)
 
@@ -1268,20 +1368,38 @@ local function EnableChestEsp()
             return
         end
 
-        if not ChestFolder then
-            local folder = Workspace:FindFirstChild(ChestFolderName)
-            if folder then
-                HookChestFolder(folder)
+        ChestScanAccum += dt
+        if ChestScanAccum < ChestScanInterval then
+            -- Still force-enable existing highlights every frame so games can't strip them quietly
+            for part, hl in pairs(ChestHighlights) do
+                if not part.Parent then
+                    DestroyChestHighlight(part)
+                elseif not hl or not hl.Parent then
+                    ChestHighlights[part] = nil
+                    EnsureChestPartHighlight(part)
+                else
+                    pcall(function()
+                        hl.Adornee = part
+                        hl.Enabled = true
+                    end)
+                end
             end
             return
         end
 
-        ChestScanAccum += dt
-        if ChestScanAccum < ChestScanInterval then
+        ChestScanAccum = 0
+
+        if not ChestFolder or not ChestFolder.Parent then
+            local folder = FindChestFolder()
+            if folder then
+                HookChestFolder(folder)
+            else
+                ClearChestHighlights()
+            end
             return
         end
-        ChestScanAccum = 0
-        ScanChestFolder()
+
+        RehighlightChests()
     end)
 end
 
