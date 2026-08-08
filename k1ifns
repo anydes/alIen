@@ -977,13 +977,13 @@ local VisualsActive = false
 
 local ChestFolderName = "BR_Chests"
 local ChestColor = Color3.fromRGB(255, 200, 50)
-local ChestHighlights = {} -- [chestModel] = Highlight
+local ChestHighlights = {} -- [chest] = Highlight
 local ChestConnections = {}
 local ChestFolder = nil
 local ChestActive = false
 local ChestScanAccum = 0
-local ChestScanInterval = 0.75
-local MaxChestHighlights = 20
+local ChestScanInterval = 0.4
+local MaxChestHighlights = 25
 
 local RayParams = RaycastParams.new()
 RayParams.FilterType = Enum.RaycastFilterType.Exclude
@@ -1088,7 +1088,8 @@ local function FindChestFolder()
         end
     end
 
-    return nil
+    -- Last resort: shallow recursive search (cached by caller)
+    return Workspace:FindFirstChild(ChestFolderName, true)
 end
 
 local function GetChestAdornee(chest)
@@ -1098,21 +1099,77 @@ local function GetChestAdornee(chest)
     if chest:IsA("BasePart") then
         return chest
     end
+
+    -- Prefer MeshParts first (what these chests use)
+    local best, bestVol = nil, -1
+    for _, desc in ipairs(chest:GetDescendants()) do
+        if desc:IsA("MeshPart") or desc:IsA("Part") then
+            local size = desc.Size
+            local vol = size.X * size.Y * size.Z
+            if vol > bestVol then
+                bestVol = vol
+                best = desc
+            end
+        end
+    end
+    if best then
+        return best
+    end
+
     if chest:IsA("Model") and chest.PrimaryPart then
         return chest.PrimaryPart
-    end
-    local mesh = chest:FindFirstChildWhichIsA("MeshPart", true)
-    if mesh then
-        return mesh
     end
     return chest:FindFirstChildWhichIsA("BasePart", true)
 end
 
+local function IsChestContainer(inst)
+    if not inst or inst == ChestFolder then
+        return false
+    end
+    if inst:IsA("Model") then
+        return true
+    end
+    if inst:IsA("BasePart") and inst.Parent == ChestFolder then
+        return true
+    end
+    return false
+end
+
+local function ResolveChestFromInstance(inst)
+    if not inst or not ChestFolder then
+        return nil
+    end
+    if not inst:IsDescendantOf(ChestFolder) and inst ~= ChestFolder then
+        return nil
+    end
+
+    local current = inst
+    while current and current ~= ChestFolder do
+        if current.Parent == ChestFolder and IsChestContainer(current) then
+            return current
+        end
+        if current:IsA("Model") and current:IsDescendantOf(ChestFolder) then
+            -- Prefer the model closest to the folder root
+            local parent = current.Parent
+            if parent == ChestFolder or (parent and parent.Parent == ChestFolder) then
+                return current
+            end
+        end
+        current = current.Parent
+    end
+
+    if IsChestContainer(inst) then
+        return inst
+    end
+    return nil
+end
+
 local function ApplyChestHighlightStyle(hl)
-    hl.DepthMode = Enum.HighlightDepthMode[RenderWallsEnabled() and "AlwaysOnTop" or "Occluded"]
+    -- AlwaysOnTop so chests stay visible through terrain/buildings
+    hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
     hl.FillColor = ChestColor
     hl.OutlineColor = DefaultOutlineColor
-    hl.FillTransparency = 0.4
+    hl.FillTransparency = 0.35
     hl.OutlineTransparency = 0
     hl.Enabled = true
 end
@@ -1145,20 +1202,90 @@ local function EnsureChestHighlight(chest)
     end
 
     local hl = ChestHighlights[chest]
-    if hl and hl.Parent then
+    if hl then
+        local okParent = false
+        pcall(function()
+            okParent = hl.Parent ~= nil
+        end)
+        if not okParent then
+            ChestHighlights[chest] = nil
+            hl = nil
+        end
+    end
+
+    if hl then
         if hl.Adornee ~= adornee then
             hl.Adornee = adornee
+        end
+        if not hl.Enabled then
+            hl.Enabled = true
         end
         return hl
     end
 
-    hl = Instance.new("Highlight")
-    hl.Name = "ChestHighlight"
-    hl.Adornee = adornee
-    ApplyChestHighlightStyle(hl)
-    hl.Parent = Folder
-    ChestHighlights[chest] = hl
-    return hl
+    local ok, created = pcall(function()
+        local h = Instance.new("Highlight")
+        h.Name = "ChestHighlight"
+        ApplyChestHighlightStyle(h)
+        h.Adornee = adornee
+        -- Parent into the MeshPart/Part so it actually renders on world props
+        h.Parent = adornee
+        return h
+    end)
+
+    if ok and created then
+        ChestHighlights[chest] = created
+        return created
+    end
+
+    -- Fallback: parent to GUI folder
+    ok, created = pcall(function()
+        local h = Instance.new("Highlight")
+        h.Name = "ChestHighlight"
+        ApplyChestHighlightStyle(h)
+        h.Adornee = adornee
+        h.Parent = Folder
+        return h
+    end)
+
+    if ok and created then
+        ChestHighlights[chest] = created
+        return created
+    end
+end
+
+local function CollectChestContainers(folder)
+    local list = {}
+    local seen = {}
+    if not folder then
+        return list
+    end
+
+    local function add(chest)
+        if chest and not seen[chest] and GetChestAdornee(chest) then
+            seen[chest] = true
+            list[#list + 1] = chest
+        end
+    end
+
+    for _, child in ipairs(folder:GetChildren()) do
+        if child:IsA("Model") or child:IsA("BasePart") then
+            add(child)
+        else
+            -- Nested folders/regions containing chest models
+            for _, desc in ipairs(child:GetDescendants()) do
+                if desc:IsA("Model") and (desc.Parent == child or desc.Parent == folder) then
+                    add(desc)
+                end
+            end
+            -- If no models found, still try the child itself
+            if child:FindFirstChildWhichIsA("BasePart", true) then
+                add(child)
+            end
+        end
+    end
+
+    return list
 end
 
 local function ResyncChests()
@@ -1172,6 +1299,8 @@ local function ResyncChests()
             ClearChestHighlights()
             return
         end
+        HookChestFolder(ChestFolder)
+        return
     end
 
     local origin = nil
@@ -1179,29 +1308,30 @@ local function ResyncChests()
         origin = CachedLocalRoot.Position
     elseif MyRoot and MyRoot.Parent then
         origin = MyRoot.Position
+    else
+        local cam = Workspace.CurrentCamera
+        origin = cam and cam.CFrame.Position
     end
 
-    local chests = {}
-    local children = ChestFolder:GetChildren()
-    for i = 1, #children do
-        local child = children[i]
-        local part = GetChestAdornee(child)
-        if part then
-            local dist = origin and (part.Position - origin).Magnitude or 0
-            chests[#chests + 1] = {chest = child, dist = dist}
-        end
+    local containers = CollectChestContainers(ChestFolder)
+    local ranked = table.create(#containers)
+    for i = 1, #containers do
+        local chest = containers[i]
+        local part = GetChestAdornee(chest)
+        local dist = (origin and part) and (part.Position - origin).Magnitude or 0
+        ranked[i] = {chest = chest, dist = dist}
     end
 
-    if origin and #chests > MaxChestHighlights then
-        table.sort(chests, function(a, b)
+    if origin and #ranked > MaxChestHighlights then
+        table.sort(ranked, function(a, b)
             return a.dist < b.dist
         end)
     end
 
     local keep = {}
-    local limit = math.min(#chests, MaxChestHighlights)
+    local limit = math.min(#ranked, MaxChestHighlights)
     for i = 1, limit do
-        local chest = chests[i].chest
+        local chest = ranked[i].chest
         keep[chest] = true
         EnsureChestHighlight(chest)
     end
@@ -1222,9 +1352,13 @@ local function UnhookChestFolderWatchers()
         ChestConnections.ChildRemoved:Disconnect()
         ChestConnections.ChildRemoved = nil
     end
+    if ChestConnections.DescendantAdded then
+        ChestConnections.DescendantAdded:Disconnect()
+        ChestConnections.DescendantAdded = nil
+    end
 end
 
-local function HookChestFolder(folder)
+function HookChestFolder(folder)
     if not folder then
         return
     end
@@ -1237,14 +1371,35 @@ local function HookChestFolder(folder)
             return
         end
         task.defer(function()
-            if child.Parent == ChestFolder then
-                EnsureChestHighlight(child)
+            if child.Parent ~= ChestFolder then
+                return
             end
+            EnsureChestHighlight(child)
+            -- MeshParts often stream in a bit later
+            task.delay(0.25, function()
+                if ChestEspEnabled() and child.Parent == ChestFolder then
+                    EnsureChestHighlight(child)
+                end
+            end)
         end)
     end)
 
     ChestConnections.ChildRemoved = folder.ChildRemoved:Connect(function(child)
         DestroyChestHighlight(child)
+    end)
+
+    -- Only reacts when a MeshPart/Part appears under a chest (cheap, no full workspace watch)
+    ChestConnections.DescendantAdded = folder.DescendantAdded:Connect(function(desc)
+        if not ChestEspEnabled() then
+            return
+        end
+        if not (desc:IsA("MeshPart") or desc:IsA("Part")) then
+            return
+        end
+        local chest = ResolveChestFromInstance(desc)
+        if chest then
+            task.defer(EnsureChestHighlight, chest)
+        end
     end)
 
     ResyncChests()
@@ -1258,6 +1413,10 @@ local function DisableChestEsp()
     if ChestConnections.FolderAdded then
         ChestConnections.FolderAdded:Disconnect()
         ChestConnections.FolderAdded = nil
+    end
+    if ChestConnections.NestedFolderAdded then
+        ChestConnections.NestedFolderAdded:Disconnect()
+        ChestConnections.NestedFolderAdded = nil
     end
     if ChestConnections.FolderRemoved then
         ChestConnections.FolderRemoved:Disconnect()
@@ -1285,6 +1444,16 @@ local function EnableChestEsp()
         end
     end)
 
+    -- Also catch BR_Chests under Workspace.Workspace
+    local nestedWs = Workspace:FindFirstChild("Workspace")
+    if nestedWs then
+        ChestConnections.NestedFolderAdded = nestedWs.ChildAdded:Connect(function(child)
+            if child.Name == ChestFolderName then
+                HookChestFolder(child)
+            end
+        end)
+    end
+
     ChestConnections.FolderRemoved = Workspace.ChildRemoved:Connect(function(child)
         if child == ChestFolder or child.Name == ChestFolderName then
             UnhookChestFolderWatchers()
@@ -1303,31 +1472,7 @@ local function EnableChestEsp()
             return
         end
         ChestScanAccum = 0
-
-        if not ChestFolder or not ChestFolder.Parent then
-            local folder = FindChestFolder()
-            if folder then
-                HookChestFolder(folder)
-            end
-            return
-        end
-
-        for chest, hl in pairs(ChestHighlights) do
-            if not chest.Parent or chest.Parent ~= ChestFolder then
-                DestroyChestHighlight(chest)
-            elseif not hl or not hl.Parent then
-                ChestHighlights[chest] = nil
-                EnsureChestHighlight(chest)
-            end
-        end
-
-        local children = ChestFolder:GetChildren()
-        for i = 1, #children do
-            local child = children[i]
-            if not ChestHighlights[child] then
-                EnsureChestHighlight(child)
-            end
-        end
+        ResyncChests()
     end)
 end
 
@@ -1973,8 +2118,9 @@ EspSettingsSection:AddToggle("RenderWalls", {
         for _, cham in pairs(ChamReference) do
             cham.DepthMode = mode
         end
+        -- Chests stay AlwaysOnTop so they remain visible
         for _, hl in pairs(ChestHighlights) do
-            hl.DepthMode = mode
+            hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
         end
     end
 })
